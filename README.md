@@ -50,16 +50,18 @@ Figures below were measured against an Aura instance of 9,060,704 nodes and 15,8
 
 **Connecting is fast when APOC is present, slow when it is not.** Schema discovery needs property types per label. `apoc.meta.nodeTypeProperties` and `apoc.meta.relTypeProperties` sample to get them; the built-in `db.schema.*` equivalents walk the entire store. On that instance the difference is a 6s connect against a 46s one, for identical results. APOC ships with Aura, so this only bites on a self-managed database without it — where the connect is working, not hung.
 
-**Compute holds the whole label in memory for the entire run** — roughly 1 KB per node, before pair scores are counted. That puts a ceiling on label size, because V8 caps its heap near 4 GB:
+**Compute holds one value per node, per field, for the entire run** — roughly 250 bytes per node. Full property maps are fetched afterwards, only for the nodes that ended up in a candidate pair. That still puts a ceiling on label size, because V8 caps its heap near 4 GB:
 
 | Label size | Node memory | Outcome |
 |---|---|---|
-| under 500,000 | under 0.5 GB | fine |
-| 500,000 – 2,000,000 | 0.5 – 2 GB | slow, heavy; Configure warns |
-| over 2,000,000 | over 2 GB | likely exhausts memory; Configure requires confirmation |
-| 6,342,823 | 6.9 GB | cannot complete |
+| under 500,000 | under 0.12 GB | fine |
+| 500,000 – 2,000,000 | 0.12 – 0.5 GB | Configure warns |
+| over 2,000,000 | over 0.5 GB | Configure requires confirmation |
+| 6,342,823 | 1.5 GB | feasible, but leaves little headroom for pair scores |
 
-The Configure screen shows the node count and projected memory once a label crosses the first threshold, and puts `Start Compute` behind an explicit checkbox past the second. Those are warnings about a real limit, not a fix for it — a run past the ceiling will close the app.
+The Configure screen shows the node count and projected memory once a label crosses the first threshold, and puts `Start Compute` behind an explicit checkbox past the second.
+
+**Candidate pairs are the other limit, and usually the one that binds.** Each costs about 325 bytes while a run is in progress, so compute stops with a message past **five million** of them rather than attempting a run it cannot finish. This is driven by the surfacing rule rather than the label — Exact Match on a field with few distinct values will reach it on a label of any size. Estimate Pair Count predicts the number before a run.
 
 **Estimate Pair Count is safe at any label size.** Its fetch is bounded at 20,000 nodes and it thins from there, so it never loads a label into memory. Use it to size an unfamiliar label before committing to a compute pass.
 

@@ -2,7 +2,7 @@ import { getDriver } from './connection-service'
 import { pairIdFor } from './pair-id'
 import { getMetric } from './metrics/registry'
 import { upsertPairs } from './session-service'
-import { estimatePairCount } from './candidate-generator'
+import { estimatePairCount, MAX_CANDIDATE_PAIRS, CandidateLimitError } from './candidate-generator'
 import { sanitize, toJsNumber } from './neo4j-int'
 import type {
   Session,
@@ -13,6 +13,10 @@ import type {
   PairEstimate,
 } from '../shared/types'
 import type { NodeRecord } from './metrics/types'
+
+// Element ids per snapshot re-fetch. The plan is a NodeByElementIdSeek, so this
+// is only about bounding one response.
+const SNAPSHOT_BATCH_SIZE = 10_000
 
 export type ProgressEvent = {
   metricId: string
@@ -31,8 +35,8 @@ export async function runMetrics(
 
   // Map pairId → accumulated scores
   const pairScores: PairScoreMap = new Map()
-  // Node snapshots captured during field fetches — no second round-trip needed
-  const snapshotMap = new Map<string, { id: string; properties: Record<string, unknown> }>()
+  // Node snapshots, fetched after scoring for the nodes that ended up in a pair.
+  const snapshotMap = new Map<string, NodeSnapshot>()
 
   // Per field, the nodes that actually carry the property. Lets surfacing tell
   // "the property is absent" apart from "both have it but they scored poorly" —
@@ -46,26 +50,30 @@ export async function runMetrics(
         onProgress({ metricId: metricConfig.metricId, fieldName: fieldConfig.propertyName, pct: 0, pairsAbove: 0 })
       }
 
-      // Include properties(n) here — we're already paying for the round-trip, and this lets
-      // us skip the separate snapshot-fetch query entirely after surfacing.
+      // Id and the one value this field needs, nothing else.
+      //
+      // This used to select properties(n) as well, so every node's full property
+      // map was held for the whole run to save a round trip later. Measured on a
+      // 6.3M-node label that is ~900 bytes per node against ~165 for id and
+      // value — 5.7GB against 1.0GB, and the larger figure does not fit. The
+      // properties are re-fetched after scoring, for the far smaller set of
+      // nodes that actually landed in a pair.
+      //
+      // Consumed as a stream rather than as result.records, so the driver's
+      // record objects are released as they are read instead of all being held
+      // at once, and so cancellation has somewhere to land.
       console.log(`[compute] Fetching nodes for ${session.label}.${fieldConfig.propertyName}…`)
-      const result = await neo4jSession.run(
+      const tFetch = Date.now()
+      const nodes: NodeRecord[] = []
+      for await (const r of neo4jSession.run(
         `MATCH (n:\`${session.label}\`) WHERE n.\`${fieldConfig.propertyName}\` IS NOT NULL ` +
-        `RETURN elementId(n) AS id, n.\`${fieldConfig.propertyName}\` AS val, properties(n) AS props`
-      )
-      const nodes: NodeRecord[] = result.records.map((r) => {
-        const id = r.get('id') as string
-        // First time we see this node, capture its full property snapshot.
-        // Sanitize each value so neo4j.Integer / BigInt becomes a plain JS number.
-        if (!snapshotMap.has(id)) {
-          const raw = (r.get('props') ?? {}) as Record<string, unknown>
-          const properties: Record<string, unknown> = {}
-          for (const [k, v] of Object.entries(raw)) properties[k] = sanitize(v)
-          snapshotMap.set(id, { id, properties })
-        }
-        return { id, value: r.get('val') }
-      })
-      console.log(`[compute] ${nodes.length} nodes fetched for ${fieldConfig.propertyName}`)
+        `RETURN elementId(n) AS id, n.\`${fieldConfig.propertyName}\` AS val`
+      )) {
+        nodes.push({ id: r.get('id') as string, value: r.get('val') })
+        if ((nodes.length & 0x3fff) === 0 && signal.aborted) break
+      }
+      if (signal.aborted) break
+      console.log(`[compute] ${nodes.length} nodes fetched for ${fieldConfig.propertyName} in ${Date.now() - tFetch}ms`)
       // The query above already filters to nodes that have the property, so this
       // is the exact set for which the field can be compared at all.
       fieldNodeIds.set(fieldConfig.propertyName, new Set(nodes.map((n) => n.id)))
@@ -75,12 +83,22 @@ export async function runMetrics(
         const metric = getMetric(metricConfig.metricId)
         console.log(`[compute] Running ${metricConfig.metricId} on ${fieldConfig.propertyName}…`)
 
-        const rawScores = await metric.computePairScores(
-          nodes,
-          metricConfig.params,
-          (pct) => onProgress({ metricId: metricConfig.metricId, fieldName: fieldConfig.propertyName, pct, pairsAbove: 0 }),
-          signal
-        )
+        let rawScores
+        try {
+          rawScores = await metric.computePairScores(
+            nodes,
+            metricConfig.params,
+            (pct) => onProgress({ metricId: metricConfig.metricId, fieldName: fieldConfig.propertyName, pct, pairsAbove: 0 }),
+            signal
+          )
+        } catch (err) {
+          if (err instanceof CandidateLimitError) {
+            throw new Error(
+              `${err.message} Reached on ${fieldConfig.propertyName} · ${metricConfig.metricId}.`
+            )
+          }
+          throw err
+        }
         console.log(`[compute] ${metricConfig.metricId} done — ${rawScores.length} pair scores`)
 
         for (const { idA, idB, score } of rawScores) {
@@ -94,6 +112,10 @@ export async function runMetrics(
             aboveThreshold: score >= metricConfig.threshold,
           })
         }
+
+        // The accumulated total can exceed the ceiling even when no single
+        // metric did, since pairs from different fields merge here.
+        if (pairScores.size > MAX_CANDIDATE_PAIRS) throw new CandidateLimitError()
       }
     }
 
@@ -104,6 +126,16 @@ export async function runMetrics(
     // the two nodes both carry. Surfacing cannot tell that apart from a genuine
     // low score, which made All mode reject pairs on comparisons that were
     // never attempted. Ask the metric for the real number instead.
+    // Properties for the nodes that ended up in a candidate pair — the only ones
+    // densify and surfacing ever look at.
+    const involved = new Set<string>()
+    for (const { idA, idB } of pairScores.values()) { involved.add(idA); involved.add(idB) }
+    const tSnap = Date.now()
+    await loadSnapshots(neo4jSession, involved, snapshotMap, signal)
+    console.log(
+      `[compute] snapshots: ${snapshotMap.size} of ${involved.size} nodes in ${Date.now() - tSnap}ms`
+    )
+
     const tDense = Date.now()
     const densified = densify(session, pairScores, snapshotMap)
     console.log(`[compute] densify: ${densified} scores filled in ${Date.now() - tDense}ms`)
@@ -140,6 +172,30 @@ export async function runMetrics(
     // Fire-and-forget — session.close() involves a network round-trip to Aura;
     // awaiting it would stall the caller after all real work is done.
     neo4jSession.close().catch(() => {})
+  }
+}
+
+// Loads full property maps for a set of node ids, in batches.
+async function loadSnapshots(
+  neo4jSession: ReturnType<ReturnType<typeof getDriver>['session']>,
+  ids: Set<string>,
+  into: Map<string, NodeSnapshot>,
+  signal: AbortSignal
+): Promise<void> {
+  const all = [...ids]
+  for (let i = 0; i < all.length; i += SNAPSHOT_BATCH_SIZE) {
+    if (signal.aborted) return
+    const batch = all.slice(i, i + SNAPSHOT_BATCH_SIZE)
+    const result = await neo4jSession.run(
+      'MATCH (n) WHERE elementId(n) IN $ids RETURN elementId(n) AS id, properties(n) AS props',
+      { ids: batch }
+    )
+    for (const r of result.records) {
+      const raw = (r.get('props') ?? {}) as Record<string, unknown>
+      const properties: Record<string, unknown> = {}
+      for (const [k, v] of Object.entries(raw)) properties[k] = sanitize(v)
+      into.set(r.get('id') as string, { id: r.get('id') as string, properties })
+    }
   }
 }
 

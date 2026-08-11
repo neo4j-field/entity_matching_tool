@@ -1,4 +1,5 @@
 import type { MetricModule, NodeRecord, PairScore } from './types'
+import { MAX_CANDIDATE_PAIRS, CandidateLimitError } from '../candidate-generator'
 
 // `pipeline()` is typed as a union of every pipeline class, and those classes'
 // call signatures do not unify — calling the result is a type error however the
@@ -49,6 +50,8 @@ function dot(a: number[], b: number[]): number {
 }
 
 function allPairScores(ids: string[], vecs: number[][]): PairScore[] {
+  // Every pair, so the ceiling is reachable at a few thousand nodes.
+  if ((ids.length * (ids.length - 1)) / 2 > MAX_CANDIDATE_PAIRS) throw new CandidateLimitError()
   const out: PairScore[] = []
   for (let i = 0; i < ids.length; i++)
     for (let j = i + 1; j < ids.length; j++)

@@ -1,4 +1,5 @@
 import type { MetricModule, PairScore } from './types'
+import { MAX_CANDIDATE_PAIRS, CandidateLimitError } from '../candidate-generator'
 
 // Double Metaphone — simplified single-code variant sufficient for entity names
 function metaphone(word: string): string {
@@ -90,9 +91,12 @@ export const phoneticMetric: MetricModule = {
     const total = coded.length
     for (const ids of buckets.values()) {
       if (signal?.aborted) break
-      for (let i = 0; i < ids.length; i++)
-        for (let j = i + 1; j < ids.length; j++)
+      for (let i = 0; i < ids.length; i++) {
+        for (let j = i + 1; j < ids.length; j++) {
+          if (results.length >= MAX_CANDIDATE_PAIRS) throw new CandidateLimitError()
           results.push({ idA: ids[i], idB: ids[j], score: 1.0 })
+        }
+      }
       done++
       onProgress(done / total)
     }

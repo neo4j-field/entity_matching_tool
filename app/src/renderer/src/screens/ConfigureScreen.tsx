@@ -29,13 +29,19 @@ interface DraftField {
 
 const SKIP_KINDS = ['boolean']
 
-// Compute holds every node of the label in memory for the whole run — measured
-// at roughly 1KB per node, before pair scores. Warn past the point where that
-// gets uncomfortable, and require an explicit choice past the point where V8's
-// ~4GB heap ceiling makes failure the likely outcome.
+// Compute holds one value per node per field for the whole run — measured at
+// roughly 250 bytes per node, down from ~1KB when it also held every node's
+// full property map. Warn past the point where that gets uncomfortable, and
+// require an explicit choice past the point where V8's ~4GB heap ceiling makes
+// failure the likely outcome.
+//
+// Thresholds are deliberately unchanged from when the per-node cost was four
+// times higher. Node count is no longer the binding constraint — candidate
+// pairs are, and compute refuses past five million of those — so loosening
+// these buys headroom against the wrong axis.
 const HEAVY_LABEL_NODES = 500_000
 const EXTREME_LABEL_NODES = 2_000_000
-const BYTES_PER_NODE = 1000
+const BYTES_PER_NODE = 250
 
 // A sampled count is an extrapolation, sometimes from well under 1% of the
 // label. Printing every digit of it claims a precision the method does not have.

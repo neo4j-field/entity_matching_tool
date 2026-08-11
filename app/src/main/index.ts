@@ -315,6 +315,7 @@ function registerIpc() {
     computeAbort = new AbortController()
     const session = sessions.loadSession(sessionId)
     if (!session) throw new Error('Session not found')
+    const priorStatus = session.status
     sessions.saveSession({ ...session, status: 'computing' })
 
     try {
@@ -326,6 +327,11 @@ function registerIpc() {
       sessions.saveSession({ ...sessions.loadSession(sessionId)!, status: 'reviewing' })
       event.sender.send(IPC.COMPUTE_DONE, distributions)
     } catch (err) {
+      // A run that fails leaves the session marked 'computing' otherwise, which
+      // it will still claim to be on the next launch. Compute can now refuse a
+      // configuration outright — over the candidate-pair ceiling — so this is a
+      // path the user can reach on purpose, not only through a driver error.
+      sessions.saveSession({ ...sessions.loadSession(sessionId)!, status: priorStatus })
       if ((err as Error).name !== 'AbortError') throw err
     }
   })
