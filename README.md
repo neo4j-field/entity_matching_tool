@@ -106,7 +106,9 @@ Controls which scored pairs enter the review queue:
 
 It stays bounded on large labels through two limits. The fetch itself stops at 20,000 nodes — the query carries the `LIMIT`, so the estimate never pulls a whole label into memory. Then, if those nodes still yield more than 50,000 candidate pairs, an evenly spaced subset of them is scored instead.
 
-Whenever either limit applies, the result is scaled by `C(N,2)/C(n,2)` against the label's true node count and reported as sampled, with the number of nodes actually scored. That scaling is unbiased in expectation, because a pair survives sampling exactly when both its nodes do — but it is noisy when true duplicates are rare, and the fetch limit takes the first 20,000 nodes in store order rather than a random draw. Treat a sampled figure as an order of magnitude, not a count.
+Whenever either limit applies, the result is scaled by `C(N,2)/C(n,2)` against the label's true node count and reported as sampled. That scaling is unbiased in expectation, because a pair survives sampling exactly when both its nodes do.
+
+Its **precision**, though, comes from the pairs actually seen rather than the pairs projected — roughly `1/√observed`. So the estimate reports that number too: *projected from 127 pairs seen in a sample of 2,000 of 2,716,446 nodes*. A hundred or more observations is worth acting on; single digits are not, and the displayed figure is rounded to match. The sample never thins below 2,000 nodes for that reason, and the fetch limit takes the first 20,000 in store order rather than a random draw.
 
 ### Missing properties, and why All is worded that way
 
