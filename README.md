@@ -27,7 +27,7 @@ Sessions are persisted in SQLite.
 
 A pass computes the pairs that the current configuration surfaces, then upserts them:
 
-- Pairs it surfaces are inserted, or have their node snapshots refreshed if already present.
+- Pairs it surfaces are inserted, or have their node snapshots refreshed if already present. A pair row belongs to exactly one session, so two sessions comparing the same nodes keep independent rows, scores, and verdicts.
 - Scores are written per `(pair, metric, field)`, replacing that exact combination.
 - **Verdicts, decision timestamps, and notes are never overwritten** — human and AI review survives any number of re-runs.
 
@@ -75,7 +75,9 @@ Controls which scored pairs enter the review queue:
 - **All fields** — surface only if every field *the two nodes can be compared on* meets its threshold
 - **Weighted average** — surface if the weighted *mean* of field scores meets a combined threshold
 
-The pair count estimate on the Configure screen shows the approximate queue size before you commit to running compute.
+**Estimate Pair Count** on the Configure screen answers the rule you have actually selected. It runs the real pipeline — candidate generation, score fill-in, and the same surfacing test compute uses — so All and Weighted Average are counted on real scores rather than on a candidate-pair bound. The number is exact.
+
+Above 50,000 candidate pairs it scores an evenly spaced sample of nodes and scales the result by `C(N,2)/C(n,2)`, reporting how many nodes it sampled. That scaling is unbiased in expectation, because a pair survives sampling exactly when both its nodes do — but it is noisy when true duplicates are rare, so treat a sampled figure as an order of magnitude rather than a count.
 
 ### Missing properties, and why All is worded that way
 
@@ -122,7 +124,7 @@ Every merge pass writes an audit record to SQLite (and optionally to the graph a
 
 None of this is required, but the tool recognises neo4j-graphrag-python's conventions and takes advantage of them when present:
 
-- `__Entity__`, `__KGBuilder__`, `Document`, and `Chunk` labels are hidden from the label selector by default. This is just a default — edit the list in Settings for any other graph.
+- `__Entity__`, `__KGBuilder__`, `Document`, `Chunk`, `_Bloom_Perspective_`, and `_Bloom_Scene_` are hidden from the label selector by default — the last two are Neo4j Bloom's, not GraphRAG's. This is just a default; edit the list in Settings for any other graph.
 - Source passages are fetched via `(:Entity)-[:FROM_CHUNK]->(:Chunk)` and displayed inline in the review panel. The query is an `OPTIONAL MATCH`, so a graph without that structure simply shows no passages rather than failing.
 - When **Neo4j storage** is enabled, decided pairs are written back as `(:ERPair)-[:INVOLVES]->(:Entity)` nodes, making deduplication decisions queryable from within the graph. This works on any graph — see [Writing results back to Neo4j](#writing-results-back-to-neo4j).
 
@@ -220,6 +222,9 @@ cd app && npm run dev
 
 ### Build
 
+`npm run build` runs `check:params`, then `typecheck`, then bundles. The
+platform targets below bundle and package:
+
 ```bash
 # macOS
 cd app && npm run build:mac
@@ -252,7 +257,7 @@ Open **Settings** from the top nav bar.
 
 | What | Where |
 |---|---|
-| Sessions, pairs, scores, audit records | `~/Library/Application Support/er-tool/er-sessions.db` (macOS) |
+| Sessions, pairs, scores, audit records | `~/Library/Application Support/app/er-sessions.db` (macOS) — Electron's `userData` directory, named after `productName` in `electron-builder.yml` |
 | LLM call ledger (tokens, cost, latency) | Same SQLite database. Retained when a session is deleted, so lifetime spend stays accurate. |
 | Connection passwords | OS keychain via keytar |
 | All other settings | Same SQLite database |
@@ -270,12 +275,15 @@ src/
     schema-service.ts       Schema discovery, PropertyKind inference
     session-service.ts      Session and pair CRUD, verdict upsert
     metric-runner.ts        Orchestrates metrics, surfacing, distributions
+    candidate-generator.ts  Token bucketing — which pairs are worth scoring
+    pair-id.ts              Session-scoped pair row ids
     merge-executor.ts       Union-find, APOC/fallback merge, audit
     assistant-service.ts    Anthropic SDK streaming
     usage-service.ts        LLM call/job ledger, aggregates, job estimation
     pricing.ts              Per-model token rates, cost computation, cache floors
     classify-service.ts     Cached prompt prefix, batching, structured parsing
     neo4j-storage.ts        Optional graph write-back
+    concurrency.ts          Order-preserving bounded parallel map
     metrics/                Eight pluggable MetricModule implementations
   preload/           Typed contextBridge (window.api)
   renderer/          React UI
@@ -289,6 +297,10 @@ src/
   shared/
     types.ts          All shared TypeScript types
     ipc-channels.ts   Typed IPC channel constants
+    constants.ts      Runtime defaults (model, batch size, concurrency)
+
+scripts/
+  check-metric-params.mjs   Build gate: metric params declared vs read
 ```
 
 ### Adding a new metric
@@ -296,3 +308,9 @@ src/
 1. Create `src/main/metrics/my-metric.ts` implementing the `MetricModule` interface from `src/main/metrics/types.ts`
 2. Register it in `src/main/metrics/registry.ts`
 3. Add its UI definition to `src/renderer/src/lib/metrics.ts` (display name, description, applicable PropertyKinds, default params)
+
+Parameters are declared in two places — `paramSchema` in the UI definition, and
+`params.x` reads in the implementation — and nothing at runtime connects them.
+Every read ends in `?? default`, so a mismatched name produces a control that
+silently does nothing rather than an error. `npm run check:params` compares the
+two lists in both directions and runs as the first step of `npm run build`.
