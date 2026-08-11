@@ -3,7 +3,7 @@ import { pairIdFor } from './pair-id'
 import { getMetric } from './metrics/registry'
 import { upsertPairs } from './session-service'
 import { tokenBucketPairs } from './candidate-generator'
-import { sanitize } from './neo4j-int'
+import { sanitize, toJsNumber } from './neo4j-int'
 import type {
   Session,
   CandidatePair,
@@ -306,8 +306,14 @@ function densify(session: Session, pairScores: PairScoreMap, snapshots: Map<stri
   return densified
 }
 
-// Above this many candidate pairs the estimate switches from exact to sampled.
+// Above this many candidate pairs the estimate thins the node set before scoring.
 const EXACT_CANDIDATE_LIMIT = 50_000
+
+// Hard ceiling on how many nodes the estimate will pull into memory. This bound
+// has to be applied by the query, not after it: the estimate used to fetch every
+// node of the label and only then decide whether to sample, which on a 6.3M-node
+// label is ~3.7 GB of property maps into the main process and kills it outright.
+const MAX_ESTIMATE_NODES = 20_000
 
 const pairCount = (n: number): number => (n * (n - 1)) / 2
 
@@ -328,38 +334,50 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
   const driver = getDriver()
   const neo4jSession = driver.session()
   try {
+    // Size the label first — a count-store lookup, independent of label size —
+    // so the fetch below can be bounded rather than discovered to be too large
+    // once it is already in memory.
+    const countResult = await neo4jSession.run(
+      `MATCH (n:\`${session.label}\`) RETURN count(n) AS total`
+    )
+    const totalNodes = toJsNumber(countResult.records[0]?.get('total') ?? 0)
+    if (totalNodes < 2) return { count: 0, exact: true, candidates: 0 }
+
     // One scan for the whole label. Per-field queries would give each field its
     // own row set, and ids from different fields cannot be compared.
+    const limit = Math.min(totalNodes, MAX_ESTIMATE_NODES)
     const result = await neo4jSession.run(
-      `MATCH (n:\`${session.label}\`) RETURN elementId(n) AS id, properties(n) AS props`
+      `MATCH (n:\`${session.label}\`) RETURN elementId(n) AS id, properties(n) AS props LIMIT ${limit}`
     )
-    const all: NodeSnapshot[] = result.records.map((r) => {
+    const fetched: NodeSnapshot[] = result.records.map((r) => {
       const raw = (r.get('props') ?? {}) as Record<string, unknown>
       const properties: Record<string, unknown> = {}
       for (const [k, v] of Object.entries(raw)) properties[k] = sanitize(v)
       return { id: r.get('id') as string, properties }
     })
-    if (all.length < 2) return { count: 0, exact: true, candidates: 0 }
+    if (fetched.length < 2) return { count: 0, exact: true, candidates: 0 }
 
-    const candidates = countCandidates(session, all)
-    let sample = all
+    const candidates = countCandidates(session, fetched)
+    let sample = fetched
     if (candidates > EXACT_CANDIDATE_LIMIT) {
       // Candidates grow with the square of node count, so scale the node sample
       // by the square root of how far over the limit we are.
-      const target = Math.floor(all.length * Math.sqrt(EXACT_CANDIDATE_LIMIT / candidates))
-      sample = strideSample(all, Math.max(2, target))
+      const target = Math.floor(fetched.length * Math.sqrt(EXACT_CANDIDATE_LIMIT / candidates))
+      sample = strideSample(fetched, Math.max(2, target))
     }
 
     const count = await surfacedCount(session, sample)
-    if (sample.length === all.length) return { count, exact: true, candidates }
+    // Exact only when every node in the label was scored — both the fetch bound
+    // and the candidate thinning have to have been no-ops.
+    if (sample.length === totalNodes) return { count, exact: true, candidates }
 
-    const scale = pairCount(all.length) / pairCount(sample.length)
+    const scale = pairCount(totalNodes) / pairCount(sample.length)
     return {
       count: Math.round(count * scale),
       exact: false,
       candidates,
       sampledNodes: sample.length,
-      totalNodes: all.length,
+      totalNodes,
     }
   } finally {
     neo4jSession.close().catch(() => {})

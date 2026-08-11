@@ -77,7 +77,9 @@ Controls which scored pairs enter the review queue:
 
 **Estimate Pair Count** on the Configure screen answers the rule you have actually selected. It runs the real pipeline — candidate generation, score fill-in, and the same surfacing test compute uses — so All and Weighted Average are counted on real scores rather than on a candidate-pair bound. The number is exact.
 
-Above 50,000 candidate pairs it scores an evenly spaced sample of nodes and scales the result by `C(N,2)/C(n,2)`, reporting how many nodes it sampled. That scaling is unbiased in expectation, because a pair survives sampling exactly when both its nodes do — but it is noisy when true duplicates are rare, so treat a sampled figure as an order of magnitude rather than a count.
+It stays bounded on large labels through two limits. The fetch itself stops at 20,000 nodes — the query carries the `LIMIT`, so the estimate never pulls a whole label into memory. Then, if those nodes still yield more than 50,000 candidate pairs, an evenly spaced subset of them is scored instead.
+
+Whenever either limit applies, the result is scaled by `C(N,2)/C(n,2)` against the label's true node count and reported as sampled, with the number of nodes actually scored. That scaling is unbiased in expectation, because a pair survives sampling exactly when both its nodes do — but it is noisy when true duplicates are rare, and the fetch limit takes the first 20,000 nodes in store order rather than a random draw. Treat a sampled figure as an order of magnitude, not a count.
 
 ### Missing properties, and why All is worded that way
 
