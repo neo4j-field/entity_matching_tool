@@ -524,7 +524,7 @@ export default function ConfigureScreen() {
                           )
                         })}
                         {applicableMetrics.length === 0 && (
-                          <span className="text-xs text-gray-600">No metrics available for kind "{field.kind}"</span>
+                          <span className="text-xs text-gray-600">No metrics available for kind &ldquo;{field.kind}&rdquo;</span>
                         )}
                       </div>
 

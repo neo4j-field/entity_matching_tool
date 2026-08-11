@@ -163,7 +163,8 @@ const api = {
 if (process.contextIsolated) {
   contextBridge.exposeInMainWorld('api', api)
 } else {
-  // @ts-ignore
+  // @ts-ignore — no contextBridge without isolation, so assign directly.
+  // `window.api` is declared for the renderer, not for this file's DOM lib.
   window.api = api
 }
 

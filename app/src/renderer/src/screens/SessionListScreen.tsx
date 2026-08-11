@@ -27,10 +27,6 @@ export default function SessionListScreen() {
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [resumingId, setResumingId] = useState<string | null>(null)
 
-  // Re-runs when the connection changes; without the dependency the list would
-  // keep showing the previous database's sessions.
-  useEffect(() => { loadSessions() }, [connection?.id])
-
   async function loadSessions() {
     // Never fall back to listing every connection's sessions — one SQLite file
     // holds them all, so an unfiltered list mixes databases together.
@@ -47,6 +43,10 @@ export default function SessionListScreen() {
       setLoading(false)
     }
   }
+
+  // Re-runs when the connection changes; without the dependency the list would
+  // keep showing the previous database's sessions.
+  useEffect(() => { loadSessions() }, [connection?.id])
 
   async function resumeSession(s: Session) {
     setResumingId(s.id)

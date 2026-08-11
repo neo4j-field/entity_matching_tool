@@ -43,7 +43,7 @@ export async function discoverSchema(): Promise<SchemaModel> {
     queryCount++
 
     // Node counts
-    let countsMap: Record<string, number> = {}
+    const countsMap: Record<string, number> = {}
     try {
       const statsResult = await session.run('CALL apoc.meta.stats() YIELD labels RETURN labels')
       queryCount++
