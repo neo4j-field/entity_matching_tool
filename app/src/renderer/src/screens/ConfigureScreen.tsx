@@ -29,6 +29,22 @@ interface DraftField {
 
 const SKIP_KINDS = ['boolean']
 
+// Compute holds every node of the label in memory for the whole run — measured
+// at roughly 1KB per node, before pair scores. Warn past the point where that
+// gets uncomfortable, and require an explicit choice past the point where V8's
+// ~4GB heap ceiling makes failure the likely outcome.
+const HEAVY_LABEL_NODES = 500_000
+const EXTREME_LABEL_NODES = 2_000_000
+const BYTES_PER_NODE = 1000
+
+// A sampled count is an extrapolation, sometimes from well under 1% of the
+// label. Printing every digit of it claims a precision the method does not have.
+function roundSampled(n: number): string {
+  if (n < 1000) return n.toLocaleString()
+  const mag = Math.pow(10, Math.floor(Math.log10(n)) - 1)
+  return (Math.round(n / mag) * mag).toLocaleString()
+}
+
 export default function ConfigureScreen() {
   const { schema, connection, session, settings, setSession, setScreen, setPairs, setDistributions, addToast } = useStore()
   const [step, setStep] = useState<Step>('label')
@@ -40,6 +56,7 @@ export default function ConfigureScreen() {
   const [estimate, setEstimate] = useState<PairEstimate | null>(null)
   const [estimating, setEstimating] = useState(false)
   const [creating, setCreating] = useState(false)
+  const [acceptLargeLabel, setAcceptLargeLabel] = useState(false)
   const [expandedMetric, setExpandedMetric] = useState<string | null>(null)
   const [aiSuggesting, setAiSuggesting] = useState(false)
   const [aiExplanation, setAiExplanation] = useState<string | null>(null)
@@ -48,6 +65,11 @@ export default function ConfigureScreen() {
 
   const hasApiKey = Boolean(settings?.anthropicApiKey)
   const weightTotal = Object.values(fieldSurfacing).reduce((sum, cfg) => sum + cfg.weight, 0)
+
+  const labelNodes = selectedLabel?.count ?? 0
+  const projectedGb = (labelNodes * BYTES_PER_NODE) / 1_073_741_824
+  const isExtremeLabel = labelNodes >= EXTREME_LABEL_NODES
+  const blockedByLabelSize = isExtremeLabel && !acceptLargeLabel
 
   useEffect(() => {
     const off = window.api.usage.onCall((record) => {
@@ -772,6 +794,34 @@ export default function ConfigureScreen() {
               </label>
             )}
 
+            {labelNodes >= HEAVY_LABEL_NODES && (
+              <div className="bg-amber-950 border border-amber-800 rounded-xl p-4 text-sm space-y-2">
+                <p className="text-amber-300 font-medium">
+                  {selectedLabel!.name} has {labelNodes.toLocaleString()} nodes
+                </p>
+                <p className="text-amber-700">
+                  Compute loads every one of them into memory and holds them for the whole run —
+                  about {projectedGb.toFixed(1)} GB for this label, before pair scores are counted.
+                  {isExtremeLabel
+                    ? ' That is past what the app can hold, so this run will most likely run out of memory and close the app.'
+                    : ' Expect a long run and heavy memory use.'}
+                </p>
+                <p className="text-amber-700">
+                  Estimate Pair Count is safe at any size — it samples rather than loading the label.
+                </p>
+                {isExtremeLabel && (
+                  <label className="flex items-center gap-2 text-amber-300 pt-1">
+                    <input
+                      type="checkbox"
+                      checked={acceptLargeLabel}
+                      onChange={(e) => setAcceptLargeLabel(e.target.checked)}
+                    />
+                    Run compute anyway
+                  </label>
+                )}
+              </div>
+            )}
+
             {/* Estimate + Start */}
             <div className="flex items-center gap-4 pt-2">
               <button onClick={runEstimate} disabled={estimating} className="btn-secondary text-sm">
@@ -780,7 +830,9 @@ export default function ConfigureScreen() {
               {estimate !== null && (
                 <span className="text-sm text-gray-400">
                   {estimate.exact ? '' : '≈ '}
-                  <span className="text-white font-medium">{estimate.count.toLocaleString()}</span>{' '}
+                  <span className="text-white font-medium">
+                    {estimate.exact ? estimate.count.toLocaleString() : roundSampled(estimate.count)}
+                  </span>{' '}
                   {estimate.count === 1 ? 'pair' : 'pairs'} surfaced by this rule
                   {!estimate.exact && (
                     <span className="text-gray-500">
@@ -791,7 +843,7 @@ export default function ConfigureScreen() {
                 </span>
               )}
               <div className="flex-1" />
-              <button onClick={startCompute} disabled={creating} className="btn-primary px-6">
+              <button onClick={startCompute} disabled={creating || blockedByLabelSize} className="btn-primary px-6">
                 {creating ? 'Starting…' : isRerun ? 'Re-run Compute →' : 'Start Compute →'}
               </button>
             </div>

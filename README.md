@@ -44,6 +44,29 @@ The practical consequence is worth stating plainly. If you configure a session w
 
 ---
 
+## Scale and limits
+
+Figures below were measured against an Aura instance of 9,060,704 nodes and 15,872,887 relationships.
+
+**Connecting to a large database takes about a minute.** Schema discovery calls `db.schema.nodeTypeProperties()` and `db.schema.relTypeProperties()`, and both walk the entire store: 33s and 10s respectively on that instance, out of 46s total. It is working, not hung.
+
+**Compute holds the whole label in memory for the entire run** — roughly 1 KB per node, before pair scores are counted. That puts a ceiling on label size, because V8 caps its heap near 4 GB:
+
+| Label size | Node memory | Outcome |
+|---|---|---|
+| under 500,000 | under 0.5 GB | fine |
+| 500,000 – 2,000,000 | 0.5 – 2 GB | slow, heavy; Configure warns |
+| over 2,000,000 | over 2 GB | likely exhausts memory; Configure requires confirmation |
+| 6,342,823 | 6.9 GB | cannot complete |
+
+The Configure screen shows the node count and projected memory once a label crosses the first threshold, and puts `Start Compute` behind an explicit checkbox past the second. Those are warnings about a real limit, not a fix for it — a run past the ceiling will close the app.
+
+**Estimate Pair Count is safe at any label size.** Its fetch is bounded at 20,000 nodes and it thins from there, so it never loads a label into memory. Use it to size an unfamiliar label before committing to a compute pass.
+
+**Cancel does not interrupt a fetch.** Cancellation is checked between metrics, so during the initial query — the longest phase on a large label — the button has no effect until the query returns.
+
+---
+
 ## Similarity metrics
 
 | Metric | Best for | Configurable params |
@@ -61,6 +84,8 @@ Candidate pairs are generated with a **token-bucket** approach (O(n × tokens), 
 
 **Exact Match and `Normalization`.** `nfkd-lower-strip` (the default) lowercases, applies Unicode NFKD, and replaces every non-alphanumeric character with a space before collapsing runs of whitespace. So `St. Louis` matches `St Louis` and `Reagan-National` matches `Reagan National`, but `Zürich` does not match `Zurich` — NFKD splits the umlaut into a combining mark, which is then replaced by a space. `none` compares the raw strings, so even `USA` and `usa` differ.
 
+**Exact Match and Phonetic on low-cardinality fields.** Both group every record sharing a value — or a phonetic code — and compare all of them pairwise, with no cap on group size. That is free on an identifier, where groups hold one or two records, and quadratic on a field with few distinct values. A month-of-year field over six million records is twelve groups and roughly 1.7 trillion pairs. Kind inference reads a short digit string as an identifier and suggests Exact Match for it, so this is reachable by accepting the defaults; check the distinct-value count before putting either metric on a field.
+
 **Edit Distance and `Min string length`.** The Levenshtein ratio is a step function of length: on a four-character value one edit costs a flat 0.25, on a two-character value it costs 0.5. Below a few characters the score reports length more than similarity, so the metric **declines to score** a pair where either value is shorter than `Min string length` (default 3) rather than returning a number no threshold can use sensibly.
 
 Declining is not failing. A field where every configured metric declined is skipped by All mode and dropped from both sides of the weighted-average ratio, exactly as a property neither node carries would be — so putting Edit Distance on a two-character field such as a US state code costs you that field, not your whole queue.
@@ -77,7 +102,9 @@ Controls which scored pairs enter the review queue:
 
 **Estimate Pair Count** on the Configure screen answers the rule you have actually selected. It runs the real pipeline — candidate generation, score fill-in, and the same surfacing test compute uses — so All and Weighted Average are counted on real scores rather than on a candidate-pair bound. The number is exact.
 
-Above 50,000 candidate pairs it scores an evenly spaced sample of nodes and scales the result by `C(N,2)/C(n,2)`, reporting how many nodes it sampled. That scaling is unbiased in expectation, because a pair survives sampling exactly when both its nodes do — but it is noisy when true duplicates are rare, so treat a sampled figure as an order of magnitude rather than a count.
+It stays bounded on large labels through two limits. The fetch itself stops at 20,000 nodes — the query carries the `LIMIT`, so the estimate never pulls a whole label into memory. Then, if those nodes still yield more than 50,000 candidate pairs, an evenly spaced subset of them is scored instead.
+
+Whenever either limit applies, the result is scaled by `C(N,2)/C(n,2)` against the label's true node count and reported as sampled, with the number of nodes actually scored. That scaling is unbiased in expectation, because a pair survives sampling exactly when both its nodes do — but it is noisy when true duplicates are rare, and the fetch limit takes the first 20,000 nodes in store order rather than a random draw. Treat a sampled figure as an order of magnitude, not a count.
 
 ### Missing properties, and why All is worded that way
 
@@ -117,6 +144,8 @@ For each group, the survivor node is chosen by highest degree (most relationship
 Property conflict strategy is selectable per merge pass: **discard** (keep survivor), **overwrite** (absorbed overwrites), or **combine** (merge arrays; needs the APOC path).
 
 Every merge pass writes an audit record to SQLite (and optionally to the graph as `ERAuditRecord` nodes).
+
+**One caveat on those records.** Without APOC the fallback path cannot combine array properties, so **combine** silently behaves as **discard** — but the audit record still stores `combine`, the strategy you asked for rather than the one that ran. On a database with APOC, which includes all of Aura, this cannot arise.
 
 ---
 

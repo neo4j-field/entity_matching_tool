@@ -2,8 +2,8 @@ import { getDriver } from './connection-service'
 import { pairIdFor } from './pair-id'
 import { getMetric } from './metrics/registry'
 import { upsertPairs } from './session-service'
-import { tokenBucketPairs } from './candidate-generator'
-import { sanitize } from './neo4j-int'
+import { estimatePairCount } from './candidate-generator'
+import { sanitize, toJsNumber } from './neo4j-int'
 import type {
   Session,
   CandidatePair,
@@ -306,8 +306,14 @@ function densify(session: Session, pairScores: PairScoreMap, snapshots: Map<stri
   return densified
 }
 
-// Above this many candidate pairs the estimate switches from exact to sampled.
+// Above this many candidate pairs the estimate thins the node set before scoring.
 const EXACT_CANDIDATE_LIMIT = 50_000
+
+// Hard ceiling on how many nodes the estimate will pull into memory. This bound
+// has to be applied by the query, not after it: the estimate used to fetch every
+// node of the label and only then decide whether to sample, which on a 6.3M-node
+// label is ~3.7 GB of property maps into the main process and kills it outright.
+const MAX_ESTIMATE_NODES = 20_000
 
 const pairCount = (n: number): number => (n * (n - 1)) / 2
 
@@ -328,38 +334,56 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
   const driver = getDriver()
   const neo4jSession = driver.session()
   try {
+    // Size the label first — a count-store lookup, independent of label size —
+    // so the fetch below can be bounded rather than discovered to be too large
+    // once it is already in memory.
+    const countResult = await neo4jSession.run(
+      `MATCH (n:\`${session.label}\`) RETURN count(n) AS total`
+    )
+    const totalNodes = toJsNumber(countResult.records[0]?.get('total') ?? 0)
+    if (totalNodes < 2) return { count: 0, exact: true, candidates: 0 }
+
     // One scan for the whole label. Per-field queries would give each field its
     // own row set, and ids from different fields cannot be compared.
+    const limit = Math.min(totalNodes, MAX_ESTIMATE_NODES)
     const result = await neo4jSession.run(
-      `MATCH (n:\`${session.label}\`) RETURN elementId(n) AS id, properties(n) AS props`
+      `MATCH (n:\`${session.label}\`) RETURN elementId(n) AS id, properties(n) AS props LIMIT ${limit}`
     )
-    const all: NodeSnapshot[] = result.records.map((r) => {
+    const fetched: NodeSnapshot[] = result.records.map((r) => {
       const raw = (r.get('props') ?? {}) as Record<string, unknown>
       const properties: Record<string, unknown> = {}
       for (const [k, v] of Object.entries(raw)) properties[k] = sanitize(v)
       return { id: r.get('id') as string, properties }
     })
-    if (all.length < 2) return { count: 0, exact: true, candidates: 0 }
+    if (fetched.length < 2) return { count: 0, exact: true, candidates: 0 }
 
-    const candidates = countCandidates(session, all)
-    let sample = all
+    console.log(`[estimate] ${session.label}: ${totalNodes} nodes, fetched ${fetched.length}`)
+    let t = Date.now()
+    const candidates = countCandidates(session, fetched)
+    console.log(`[estimate] countCandidates: ${candidates.toLocaleString()} in ${Date.now() - t}ms`)
+    let sample = fetched
     if (candidates > EXACT_CANDIDATE_LIMIT) {
       // Candidates grow with the square of node count, so scale the node sample
       // by the square root of how far over the limit we are.
-      const target = Math.floor(all.length * Math.sqrt(EXACT_CANDIDATE_LIMIT / candidates))
-      sample = strideSample(all, Math.max(2, target))
+      const target = Math.floor(fetched.length * Math.sqrt(EXACT_CANDIDATE_LIMIT / candidates))
+      sample = strideSample(fetched, Math.max(2, target))
     }
 
+    console.log(`[estimate] scoring ${sample.length} nodes across ${session.fields.length} fields`)
+    t = Date.now()
     const count = await surfacedCount(session, sample)
-    if (sample.length === all.length) return { count, exact: true, candidates }
+    console.log(`[estimate] surfacedCount: ${count} in ${Date.now() - t}ms`)
+    // Exact only when every node in the label was scored — both the fetch bound
+    // and the candidate thinning have to have been no-ops.
+    if (sample.length === totalNodes) return { count, exact: true, candidates }
 
-    const scale = pairCount(all.length) / pairCount(sample.length)
+    const scale = pairCount(totalNodes) / pairCount(sample.length)
     return {
       count: Math.round(count * scale),
       exact: false,
       candidates,
       sampledNodes: sample.length,
-      totalNodes: all.length,
+      totalNodes,
     }
   } finally {
     neo4jSession.close().catch(() => {})
@@ -367,26 +391,44 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
 }
 
 // Upper bound on how many pairs the pipeline would score, used only to decide
-// whether to sample. Semantic cosine scores every pair, so it dominates when present.
+// how far to thin the sample. Different metrics group candidates differently and
+// the widest grouping is what has to be modelled, or the thinning is sized
+// against the wrong number and the scoring step runs out of memory.
 function countCandidates(session: Session, nodes: NodeSnapshot[]): number {
-  let semanticMax = 0
-  const union = new Set<string>()
+  let widest = 0
 
   for (const fieldConfig of session.fields) {
     const present = nodes.filter((n) => n.properties[fieldConfig.propertyName] !== undefined)
     if (present.length < 2) continue
 
-    if (fieldConfig.metrics.some((m) => m.metricId === 'semantic-cosine')) {
-      semanticMax = Math.max(semanticMax, pairCount(present.length))
-      continue
+    for (const metricConfig of fieldConfig.metrics) {
+      // Scores every pair regardless of value.
+      if (metricConfig.metricId === 'semantic-cosine') {
+        widest = Math.max(widest, pairCount(present.length))
+        continue
+      }
+
+      const values = present.map((n) => String(n.properties[fieldConfig.propertyName]))
+
+      // Exact match and phonetic bucket on the whole value — one bucket per
+      // distinct value or code — and neither caps bucket size the way token
+      // bucketing does. On a low-cardinality field such as a month number that
+      // is a handful of enormous buckets: twelve values over twenty thousand
+      // nodes is millions of pairs, where the token count would report none.
+      if (metricConfig.metricId === 'exact-match' || metricConfig.metricId === 'phonetic') {
+        const freq = new Map<string, number>()
+        for (const v of values) freq.set(v, (freq.get(v) ?? 0) + 1)
+        let total = 0
+        for (const size of freq.values()) if (size > 1) total += pairCount(size)
+        widest = Math.max(widest, total)
+        continue
+      }
+
+      // Token bucketing — counted, never materialised. See estimatePairCount.
+      widest = Math.max(widest, estimatePairCount(present.map((n, i) => ({ id: n.id, value: values[i] }))))
     }
-    const strings = present.map((n) => ({
-      id: n.id,
-      value: String(n.properties[fieldConfig.propertyName]),
-    }))
-    for (const [a, b] of tokenBucketPairs(strings)) union.add(`${a}|${b}`)
   }
-  return Math.max(union.size, semanticMax)
+  return widest
 }
 
 async function surfacedCount(session: Session, nodes: NodeSnapshot[]): Promise<number> {
