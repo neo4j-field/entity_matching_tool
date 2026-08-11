@@ -2,7 +2,7 @@ import { getDriver } from './connection-service'
 import { pairIdFor } from './pair-id'
 import { getMetric } from './metrics/registry'
 import { upsertPairs } from './session-service'
-import { tokenBucketPairs } from './candidate-generator'
+import { estimatePairCount } from './candidate-generator'
 import { sanitize, toJsNumber } from './neo4j-int'
 import type {
   Session,
@@ -357,7 +357,10 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
     })
     if (fetched.length < 2) return { count: 0, exact: true, candidates: 0 }
 
+    console.log(`[estimate] ${session.label}: ${totalNodes} nodes, fetched ${fetched.length}`)
+    let t = Date.now()
     const candidates = countCandidates(session, fetched)
+    console.log(`[estimate] countCandidates: ${candidates.toLocaleString()} in ${Date.now() - t}ms`)
     let sample = fetched
     if (candidates > EXACT_CANDIDATE_LIMIT) {
       // Candidates grow with the square of node count, so scale the node sample
@@ -366,7 +369,10 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
       sample = strideSample(fetched, Math.max(2, target))
     }
 
+    console.log(`[estimate] scoring ${sample.length} nodes across ${session.fields.length} fields`)
+    t = Date.now()
     const count = await surfacedCount(session, sample)
+    console.log(`[estimate] surfacedCount: ${count} in ${Date.now() - t}ms`)
     // Exact only when every node in the label was scored — both the fetch bound
     // and the candidate thinning have to have been no-ops.
     if (sample.length === totalNodes) return { count, exact: true, candidates }
@@ -385,26 +391,44 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
 }
 
 // Upper bound on how many pairs the pipeline would score, used only to decide
-// whether to sample. Semantic cosine scores every pair, so it dominates when present.
+// how far to thin the sample. Different metrics group candidates differently and
+// the widest grouping is what has to be modelled, or the thinning is sized
+// against the wrong number and the scoring step runs out of memory.
 function countCandidates(session: Session, nodes: NodeSnapshot[]): number {
-  let semanticMax = 0
-  const union = new Set<string>()
+  let widest = 0
 
   for (const fieldConfig of session.fields) {
     const present = nodes.filter((n) => n.properties[fieldConfig.propertyName] !== undefined)
     if (present.length < 2) continue
 
-    if (fieldConfig.metrics.some((m) => m.metricId === 'semantic-cosine')) {
-      semanticMax = Math.max(semanticMax, pairCount(present.length))
-      continue
+    for (const metricConfig of fieldConfig.metrics) {
+      // Scores every pair regardless of value.
+      if (metricConfig.metricId === 'semantic-cosine') {
+        widest = Math.max(widest, pairCount(present.length))
+        continue
+      }
+
+      const values = present.map((n) => String(n.properties[fieldConfig.propertyName]))
+
+      // Exact match and phonetic bucket on the whole value — one bucket per
+      // distinct value or code — and neither caps bucket size the way token
+      // bucketing does. On a low-cardinality field such as a month number that
+      // is a handful of enormous buckets: twelve values over twenty thousand
+      // nodes is millions of pairs, where the token count would report none.
+      if (metricConfig.metricId === 'exact-match' || metricConfig.metricId === 'phonetic') {
+        const freq = new Map<string, number>()
+        for (const v of values) freq.set(v, (freq.get(v) ?? 0) + 1)
+        let total = 0
+        for (const size of freq.values()) if (size > 1) total += pairCount(size)
+        widest = Math.max(widest, total)
+        continue
+      }
+
+      // Token bucketing — counted, never materialised. See estimatePairCount.
+      widest = Math.max(widest, estimatePairCount(present.map((n, i) => ({ id: n.id, value: values[i] }))))
     }
-    const strings = present.map((n) => ({
-      id: n.id,
-      value: String(n.properties[fieldConfig.propertyName]),
-    }))
-    for (const [a, b] of tokenBucketPairs(strings)) union.add(`${a}|${b}`)
   }
-  return Math.max(union.size, semanticMax)
+  return widest
 }
 
 async function surfacedCount(session: Session, nodes: NodeSnapshot[]): Promise<number> {

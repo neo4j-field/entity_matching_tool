@@ -37,6 +37,14 @@ const HEAVY_LABEL_NODES = 500_000
 const EXTREME_LABEL_NODES = 2_000_000
 const BYTES_PER_NODE = 1000
 
+// A sampled count is an extrapolation, sometimes from well under 1% of the
+// label. Printing every digit of it claims a precision the method does not have.
+function roundSampled(n: number): string {
+  if (n < 1000) return n.toLocaleString()
+  const mag = Math.pow(10, Math.floor(Math.log10(n)) - 1)
+  return (Math.round(n / mag) * mag).toLocaleString()
+}
+
 export default function ConfigureScreen() {
   const { schema, connection, session, settings, setSession, setScreen, setPairs, setDistributions, addToast } = useStore()
   const [step, setStep] = useState<Step>('label')
@@ -822,7 +830,9 @@ export default function ConfigureScreen() {
               {estimate !== null && (
                 <span className="text-sm text-gray-400">
                   {estimate.exact ? '' : '≈ '}
-                  <span className="text-white font-medium">{estimate.count.toLocaleString()}</span>{' '}
+                  <span className="text-white font-medium">
+                    {estimate.exact ? estimate.count.toLocaleString() : roundSampled(estimate.count)}
+                  </span>{' '}
                   {estimate.count === 1 ? 'pair' : 'pairs'} surfaced by this rule
                   {!estimate.exact && (
                     <span className="text-gray-500">

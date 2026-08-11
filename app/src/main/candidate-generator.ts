@@ -46,9 +46,29 @@ export function tokenBucketPairs(nodes: StringNode[], maxBucketSize = 500): [str
 }
 
 /**
- * Estimates the number of candidate pairs without scoring.
- * Used by the Recalculate button — this is an upper bound.
+ * Upper bound on the candidate pairs, counted without building any of them.
+ *
+ * Sizing the candidate set by calling tokenBucketPairs and reading .length costs
+ * memory proportional to the pairs themselves — a Set of `${idA}|${idB}` strings,
+ * each about 85 characters once element ids are involved. On twenty thousand
+ * multi-word values across a dozen fields that runs to gigabytes, which is how
+ * the pair estimate exhausted the heap even after its fetch was bounded.
+ *
+ * A pair sharing several tokens is counted once per shared token, so this
+ * overshoots. That is the safe direction: the number is only used to decide how
+ * far to thin the sample, and overshooting thins harder.
  */
 export function estimatePairCount(nodes: StringNode[], maxBucketSize = 500): number {
-  return tokenBucketPairs(nodes, maxBucketSize).length
+  const sizes = new Map<string, number>()
+  for (const { value } of nodes) {
+    for (const tok of new Set(tokenize(value, 'whitespace-lowercase'))) {
+      sizes.set(tok, (sizes.get(tok) ?? 0) + 1)
+    }
+  }
+  let total = 0
+  for (const size of sizes.values()) {
+    if (size < 2 || size > maxBucketSize) continue
+    total += (size * (size - 1)) / 2
+  }
+  return total
 }
