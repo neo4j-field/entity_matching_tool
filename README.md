@@ -48,7 +48,7 @@ The practical consequence is worth stating plainly. If you configure a session w
 
 Figures below were measured against an Aura instance of 9,060,704 nodes and 15,872,887 relationships.
 
-**Connecting to a large database takes about a minute.** Schema discovery calls `db.schema.nodeTypeProperties()` and `db.schema.relTypeProperties()`, and both walk the entire store: 33s and 10s respectively on that instance, out of 46s total. It is working, not hung.
+**Connecting is fast when APOC is present, slow when it is not.** Schema discovery needs property types per label. `apoc.meta.nodeTypeProperties` and `apoc.meta.relTypeProperties` sample to get them; the built-in `db.schema.*` equivalents walk the entire store. On that instance the difference is a 6s connect against a 46s one, for identical results. APOC ships with Aura, so this only bites on a self-managed database without it — where the connect is working, not hung.
 
 **Compute holds the whole label in memory for the entire run** — roughly 1 KB per node, before pair scores are counted. That puts a ceiling on label size, because V8 caps its heap near 4 GB:
 
