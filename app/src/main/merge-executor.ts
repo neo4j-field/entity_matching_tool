@@ -116,7 +116,7 @@ export async function applyMerges(
     try {
       const survivorId = apocAvailable
         ? await mergeWithApoc(driver, group.memberIds, conflictStrategy)
-        : await mergeWithFallback(driver, group.memberIds, conflictStrategy, apocAvailable)
+        : await mergeWithFallback(driver, group.memberIds, conflictStrategy)
 
       if (survivorId) {
         const record = writeAuditRecord(sessionId, passId, group, survivorId, conflictStrategy)
@@ -158,8 +158,7 @@ async function mergeWithApoc(
 async function mergeWithFallback(
   driver: ReturnType<typeof getDriver>,
   groupIds: string[],
-  strategy: string,
-  _apoc: boolean
+  strategy: string
 ): Promise<string | null> {
   const session = driver.session()
   const tx = session.beginTransaction()

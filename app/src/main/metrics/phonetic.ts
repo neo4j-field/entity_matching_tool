@@ -86,7 +86,8 @@ export const phoneticMetric: MetricModule = {
     }
 
     const results: PairScore[] = []
-    let done = 0, total = coded.length
+    let done = 0
+    const total = coded.length
     for (const ids of buckets.values()) {
       if (signal?.aborted) break
       for (let i = 0; i < ids.length; i++)
