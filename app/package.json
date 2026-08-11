@@ -32,7 +32,8 @@
     "zustand": "^5.0.13"
   },
   "overrides": {
-    "tmp": ">=0.2.6"
+    "sharp": "^0.35.0",
+    "adm-zip": "^0.6.0"
   },
   "devDependencies": {
     "@electron-toolkit/eslint-config-prettier": "^3.0.0",
