@@ -16,6 +16,10 @@ const MAX_SAMPLE_VALUES = 10
 // queries. Well inside the driver's default connection pool.
 const LABEL_SAMPLE_CONCURRENCY = 8
 
+// Nodes per sampled record for apoc.meta.*. One in a thousand was enough to
+// return property sets identical to a full scan on a 9M-node database.
+const SCHEMA_SAMPLE_RATE = 1000
+
 export async function discoverSchema(): Promise<SchemaModel> {
   const driver = getDriver()
   const { excludedLabels } = getSettings()
@@ -24,48 +28,77 @@ export async function discoverSchema(): Promise<SchemaModel> {
   let queryCount = 0
   const session = driver.session()
   try {
-    // Node type properties
-    const propResult = await session.run(`
-      CALL db.schema.nodeTypeProperties()
-      YIELD nodeLabels, propertyName, propertyTypes, mandatory
-      RETURN nodeLabels, propertyName, propertyTypes, mandatory
-      ORDER BY nodeLabels, propertyName
-    `)
-    queryCount++
-
-    // Relationship types
-    const relResult = await session.run(`
-      CALL db.schema.relTypeProperties()
-      YIELD relType, propertyName, propertyTypes
-      RETURN relType, propertyName, propertyTypes
-      ORDER BY relType
-    `)
-    queryCount++
-
-    // Node counts
-    const countsMap: Record<string, number> = {}
-    try {
-      const statsResult = await session.run('CALL apoc.meta.stats() YIELD labels RETURN labels')
-      queryCount++
-      const raw = statsResult.records[0].get('labels') as Record<string, unknown>
-      for (const [k, v] of Object.entries(raw)) countsMap[k] = toJsNumber(v)
-    } catch {
-      const fallback = await session.run(`
-        MATCH (n) UNWIND labels(n) AS lab
-        RETURN lab AS label, count(n) AS total ORDER BY total DESC
-      `)
-      for (const r of fallback.records) {
-        countsMap[r.get('label') as string] = toJsNumber(r.get('total'))
-      }
-    }
-
-    // APOC availability
+    // Probe APOC first — it decides which schema source to use below, and the
+    // probe itself is a constant-time call.
     let apocAvailable = false
     try {
       await session.run('RETURN apoc.version() AS v')
       queryCount++
       apocAvailable = true
     } catch { /* not available */ }
+
+    // Property types, from whichever source can answer without reading the
+    // whole store.
+    //
+    // db.schema.nodeTypeProperties() and db.schema.relTypeProperties() scan
+    // every node and every relationship to determine types. On a 9.06M-node
+    // instance that measured 33s and 10s, out of a 46s connect. APOC's
+    // equivalents sample instead: 2.5s and 2.7s for identical property sets on
+    // the same database.
+    //
+    // The two report different type vocabularies — `String` where db.schema
+    // says `STRING NOT NULL`, `StringArray` where it says
+    // `LIST<STRING NOT NULL>` — which normalizeTypeName reconciles. That is the
+    // part to be careful with: matching one vocabulary and not the other is
+    // what once classified every property as kind 'other'.
+    const tTypes = Date.now()
+    const propResult = await session.run(
+      apocAvailable
+        ? `CALL apoc.meta.nodeTypeProperties({sample: ${SCHEMA_SAMPLE_RATE}})
+           YIELD nodeLabels, propertyName, propertyTypes, mandatory
+           RETURN nodeLabels, propertyName, propertyTypes, mandatory
+           ORDER BY nodeLabels, propertyName`
+        : `CALL db.schema.nodeTypeProperties()
+           YIELD nodeLabels, propertyName, propertyTypes, mandatory
+           RETURN nodeLabels, propertyName, propertyTypes, mandatory
+           ORDER BY nodeLabels, propertyName`
+    )
+    queryCount++
+
+    const relResult = await session.run(
+      apocAvailable
+        ? `CALL apoc.meta.relTypeProperties({sample: ${SCHEMA_SAMPLE_RATE}})
+           YIELD relType, propertyName, propertyTypes
+           RETURN relType, propertyName, propertyTypes
+           ORDER BY relType`
+        : `CALL db.schema.relTypeProperties()
+           YIELD relType, propertyName, propertyTypes
+           RETURN relType, propertyName, propertyTypes
+           ORDER BY relType`
+    )
+    queryCount++
+    console.log(
+      `[schema] property types via ${apocAvailable ? 'apoc.meta.*' : 'db.schema.*'} ` +
+        `in ${Date.now() - tTypes}ms`
+    )
+
+    // Node counts
+    const countsMap: Record<string, number> = {}
+    if (apocAvailable) {
+      const statsResult = await session.run('CALL apoc.meta.stats() YIELD labels RETURN labels')
+      queryCount++
+      const raw = statsResult.records[0].get('labels') as Record<string, unknown>
+      for (const [k, v] of Object.entries(raw)) countsMap[k] = toJsNumber(v)
+    } else {
+      const fallback = await session.run(`
+        MATCH (n) UNWIND labels(n) AS lab
+        RETURN lab AS label, count(n) AS total ORDER BY total DESC
+      `)
+      queryCount++
+      for (const r of fallback.records) {
+        countsMap[r.get('label') as string] = toJsNumber(r.get('total'))
+      }
+    }
 
     // Build label map
     const labelMap = new Map<string, { properties: Map<string, PropertyMeta> }>()
@@ -223,17 +256,24 @@ const DATE_TYPES = new Set([
   'DURATION',
 ])
 
-// db.schema.nodeTypeProperties() reports Cypher type names, which on Neo4j 5+
-// carry a nullability suffix and may be wrapped in a list: "STRING NOT NULL",
-// "LIST<STRING NOT NULL> NOT NULL". Matching the bare Neo4j 4 spellings
-// ("String", "Long") therefore matched nothing, and every property in a modern
-// database was classified 'other'. Reduce to a bare element type first.
+// The two schema sources spell types differently, and both reach here.
+//
+//   db.schema.*      STRING NOT NULL   INTEGER NOT NULL   LIST<STRING NOT NULL> NOT NULL
+//   apoc.meta.*      String            Long               StringArray
+//
+// Uppercasing reconciles most of that on its own — the reason Neo4j 4 spellings
+// once matched nothing, classifying every property as 'other', was the
+// nullability suffix rather than the case. The one structural difference left is
+// how a list is written, so both spellings reduce to their element type: a list
+// of strings is string-like for similarity purposes either way.
 function normalizeTypeName(raw: string): string {
   let t = raw.toUpperCase().replace(/\bNOT\s+NULL\b/g, '')
   const list = t.match(/^\s*LIST<(.+)>\s*$/)
   if (list) t = list[1]
-  // A list of strings is still string-like for similarity purposes.
-  return t.replace(/\s+/g, '')
+  t = t.replace(/\s+/g, '')
+  const array = t.match(/^(.+)ARRAY$/)
+  if (array) t = array[1]
+  return t
 }
 
 function inferKind(meta: PropertyMeta): PropertyKind {
