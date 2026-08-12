@@ -58,18 +58,18 @@ export const jaroWinklerMetric: MetricModule = {
 
   async computePairScores(nodes, params, onProgress, signal) {
     const p = (params.prefixWeight as number) ?? 0.1
-    const strings = nodes
-      .map((n) => ({ id: n.id, val: typeof n.value === 'string' ? n.value.toLowerCase() : null }))
-      .filter((n): n is { id: string; val: string } => n.val !== null)
+    const items = nodes
+      .map((n) => ({ id: n.id, values: stringValues(n.value).map((v) => v.toLowerCase()) }))
+      .filter((n) => n.values.length > 0)
 
-    const candidates = tokenBucketPairs(strings.map((s) => ({ id: s.id, value: s.val })))
+    const byId = new Map(items.map((s) => [s.id, s.values]))
+    const candidates = tokenBucketPairs(items.map((s) => ({ id: s.id, value: s.values.join(' ') })))
     const results: PairScore[] = []
     let done = 0
     for (const [idA, idB] of candidates) {
       if (signal?.aborted) break
-      const a = strings.find((s) => s.id === idA)!.val
-      const b = strings.find((s) => s.id === idB)!.val
-      results.push({ idA, idB, score: jaroWinkler(a, b, p) })
+      const score = bestOf(byId.get(idA)!, byId.get(idB)!, (x, y) => jaroWinkler(x, y, p))
+      if (score !== null) results.push({ idA, idB, score })
       onProgress(++done / candidates.length)
     }
     return results

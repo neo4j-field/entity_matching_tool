@@ -47,20 +47,23 @@ export const editDistance: MetricModule = {
 
   async computePairScores(nodes, params, onProgress, signal) {
     const minLen = minLenOf(params)
-    const strings = nodes
-      .map((n) => ({ id: n.id, val: typeof n.value === 'string' ? n.value : null }))
-      .filter((n): n is { id: string; val: string } => n.val !== null && n.val.length >= minLen)
+    // Bucket on every value the node holds, score across all of them. Joining
+    // for the bucket key unions the tokens; the scoring below still sees the
+    // values separately, so a list never gets compared as one run-on string.
+    const items = nodes
+      .map((n) => ({ id: n.id, values: stringValues(n.value).filter((v) => v.length >= minLen) }))
+      .filter((n) => n.values.length > 0)
 
-    const byId = new Map(strings.map((s) => [s.id, s.val]))
-    const candidates = tokenBucketPairs(strings.map((s) => ({ id: s.id, value: s.val })))
+    const byId = new Map(items.map((s) => [s.id, s.values]))
+    const candidates = tokenBucketPairs(items.map((s) => ({ id: s.id, value: s.values.join(' ') })))
     const results: PairScore[] = []
     let done = 0
     for (const [idA, idB] of candidates) {
       if (signal?.aborted) break
-      const a = byId.get(idA)!
-      const b = byId.get(idB)!
-      const dist = levenshtein(a, b)
-      const score = 1 - dist / Math.max(a.length, b.length, 1)
+      const score = bestOf(byId.get(idA)!, byId.get(idB)!, (x, y) =>
+        1 - levenshtein(x, y) / Math.max(x.length, y.length, 1)
+      )
+      if (score === null) continue
       results.push({ idA, idB, score })
       onProgress(++done / candidates.length)
     }

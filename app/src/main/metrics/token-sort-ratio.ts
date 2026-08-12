@@ -40,20 +40,19 @@ export const tokenSortRatio: MetricModule = {
     const sorted = nodes
       .map((n) => ({
         id: n.id,
-        val: typeof n.value === 'string'
-          ? tokenize(n.value, mode).sort().join(' ')
-          : null,
+        values: stringValues(n.value).map((v) => tokenize(v, mode).sort().join(' ')),
       }))
-      .filter((n): n is { id: string; val: string } => n.val !== null)
+      .filter((n) => n.values.length > 0)
 
-    const candidates = tokenBucketPairs(sorted.map((s) => ({ id: s.id, value: s.val })))
-    const byId = new Map(sorted.map((s) => [s.id, s.val]))
+    const candidates = tokenBucketPairs(sorted.map((s) => ({ id: s.id, value: s.values.join(' ') })))
+    const byId = new Map(sorted.map((s) => [s.id, s.values]))
     const results: PairScore[] = []
     let done = 0
 
     for (const [idA, idB] of candidates) {
       if (signal?.aborted) break
-      results.push({ idA, idB, score: sequenceRatio(byId.get(idA)!, byId.get(idB)!) })
+      const score = bestOf(byId.get(idA)!, byId.get(idB)!, (x, y) => sequenceRatio(x, y))
+      if (score !== null) results.push({ idA, idB, score })
       onProgress(++done / candidates.length)
     }
     return results
