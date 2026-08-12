@@ -550,7 +550,15 @@ export default function ReviewScreen() {
   const { session, pairs, setPairs, updatePairVerdict, addToast, setSession, setScreen, settings } = useStore()
   const [filter, setFilter] = useState<VerdictFilter>('all')
   const [sort, setSort] = useState<'pending-first' | 'score-desc' | 'score-asc'>('pending-first')
-  const [currentIdx, setCurrentIdx] = useState(0)
+  // The pair being reviewed is tracked by id, not by position.
+  //
+  // filteredPairs is re-sorted on every render, and deciding a pair changes
+  // where it sorts: under "Pending first" it moves to the end, so every pair
+  // after it shifts down one. Advancing an index then lands two along, and
+  // marking a queue of eight verdicts reviewed four of them — p0, p2, p4, p6 —
+  // before running off the end and reporting itself done with four still
+  // pending. An id survives the reshuffle; an index does not.
+  const [currentId, setCurrentId] = useState<string | null>(null)
   const [showShortcuts, setShowShortcuts] = useState(false)
   const [showMerge, setShowMerge] = useState(false)
   const [showAutoClassify, setShowAutoClassify] = useState(false)
@@ -582,6 +590,8 @@ export default function ReviewScreen() {
     return list
   })()
 
+  const foundIdx = currentId === null ? -1 : filteredPairs.findIndex((p) => p.id === currentId)
+  const currentIdx = foundIdx === -1 ? 0 : foundIdx
   const currentPair = filteredPairs[currentIdx] ?? null
   const pending = pairs.filter((p) => p.verdict === 'pending').length
   const decided = pairs.length - pending
@@ -594,19 +604,24 @@ export default function ReviewScreen() {
   }, [currentPair?.id])
 
   const goNext = useCallback(() => {
-    setCurrentIdx((i) => Math.min(i + 1, filteredPairs.length - 1))
-  }, [filteredPairs.length])
+    const next = filteredPairs[currentIdx + 1]
+    if (next) setCurrentId(next.id)
+  }, [filteredPairs, currentIdx])
 
   const goPrev = useCallback(() => {
-    setCurrentIdx((i) => Math.max(i - 1, 0))
-  }, [])
+    const prev = filteredPairs[currentIdx - 1]
+    if (prev) setCurrentId(prev.id)
+  }, [filteredPairs, currentIdx])
 
   const markVerdict = useCallback(async (verdict: Verdict) => {
     if (!currentPair) return
+    // Read the next pair from the list as it stands now. Applying the verdict
+    // re-sorts it, so anything derived afterwards points at the wrong row.
+    const nextId = filteredPairs[currentIdx + 1]?.id ?? null
     updatePairVerdict(currentPair.id, verdict)
     await window.api.pairs.setVerdict(currentPair.id, verdict)
-    goNext()
-  }, [currentPair, goNext, updatePairVerdict])
+    if (nextId !== null) setCurrentId(nextId)
+  }, [currentPair, filteredPairs, currentIdx, updatePairVerdict])
 
   async function saveNote() {
     if (!currentPair) return
@@ -691,7 +706,7 @@ export default function ReviewScreen() {
         <div className="px-3 py-2 border-b border-gray-800">
           <select
             value={filter}
-            onChange={(e) => { setFilter(e.target.value as VerdictFilter); setCurrentIdx(0) }}
+            onChange={(e) => { setFilter(e.target.value as VerdictFilter); setCurrentId(null) }}
             className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300"
           >
             <option value="all">All ({pairs.length})</option>
@@ -709,7 +724,7 @@ export default function ReviewScreen() {
             return (
               <button
                 key={pair.id}
-                onClick={() => setCurrentIdx(i)}
+                onClick={() => setCurrentId(pair.id)}
                 className={`w-full text-left px-3 py-2.5 border-b border-gray-800/50 hover:bg-gray-800/50 transition-colors ${i === currentIdx ? 'bg-gray-800' : ''}`}
               >
                 <div className="flex items-start justify-between gap-1">
@@ -754,7 +769,7 @@ export default function ReviewScreen() {
           </span>
           <select
             value={sort}
-            onChange={(e) => { setSort(e.target.value as typeof sort); setCurrentIdx(0) }}
+            onChange={(e) => { setSort(e.target.value as typeof sort); setCurrentId(null) }}
             className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300"
           >
             <option value="pending-first">Pending first</option>
