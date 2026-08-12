@@ -365,6 +365,20 @@ function densify(session: Session, pairScores: PairScoreMap, snapshots: Map<stri
 // Above this many candidate pairs the estimate thins the node set before scoring.
 const EXACT_CANDIDATE_LIMIT = 50_000
 
+// Floor on the thinned sample.
+//
+// The thinning formula bounds scoring work but says nothing about statistical
+// power, and on a dense field it thins the sample into uselessness. Measured on
+// a 2.7M-node label whose rule reported 60.6M candidates: the formula chose 574
+// nodes, which surfaced 9 pairs, and repeating that sample at five points in the
+// store projected between 22M and 202M — a ninefold spread, Poisson noise on
+// single-digit counts. At 2,000 nodes the same rule observed 127 pairs and at
+// 5,000 it observed 670; those two agree within 9%.
+//
+// C(2000,2) is 2M comparisons — a few seconds rather than half of one. That cost
+// buys the difference between a number worth acting on and one that is not.
+const MIN_SCORED_NODES = 2_000
+
 // Hard ceiling on how many nodes the estimate will pull into memory. This bound
 // has to be applied by the query, not after it: the estimate used to fetch every
 // node of the label and only then decide whether to sample, which on a 6.3M-node
@@ -420,9 +434,10 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
     let sample = fetched
     if (candidates > EXACT_CANDIDATE_LIMIT) {
       // Candidates grow with the square of node count, so scale the node sample
-      // by the square root of how far over the limit we are.
+      // by the square root of how far over the limit we are — then never go
+      // below the floor, however dense the field.
       const target = Math.floor(fetched.length * Math.sqrt(EXACT_CANDIDATE_LIMIT / candidates))
-      sample = strideSample(fetched, Math.max(2, target))
+      sample = strideSample(fetched, Math.min(fetched.length, Math.max(MIN_SCORED_NODES, target)))
     }
 
     console.log(`[estimate] scoring ${sample.length} nodes across ${session.fields.length} fields`)
@@ -455,6 +470,9 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
       candidates,
       sampledNodes: sample.length,
       totalNodes,
+      // Pairs actually seen. The scaled figure is only as good as this number,
+      // and nothing else in the result reveals it.
+      observed: count,
       projectedCandidates,
     }
   } finally {

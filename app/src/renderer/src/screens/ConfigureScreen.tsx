@@ -44,11 +44,14 @@ const HEAVY_LABEL_NODES = 500_000
 const EXTREME_LABEL_NODES = 2_000_000
 const BYTES_PER_NODE = 250
 
-// A sampled count is an extrapolation, sometimes from well under 1% of the
-// label. Printing every digit of it claims a precision the method does not have.
-function roundSampled(n: number): string {
-  if (n < 1000) return n.toLocaleString()
-  const mag = Math.pow(10, Math.floor(Math.log10(n)) - 1)
+// A sampled count is an extrapolation, and its precision follows roughly
+// 1/sqrt(observed) — the pairs actually seen, not the pairs projected. Ten
+// observations carry about a third of a digit of information, so print one
+// significant figure; a hundred or more earns a second.
+function roundSampled(n: number, observed: number | undefined): string {
+  if (n < 100) return n.toLocaleString()
+  const digits = observed !== undefined && observed < 100 ? 1 : 2
+  const mag = Math.pow(10, Math.floor(Math.log10(n)) - (digits - 1))
   return (Math.round(n / mag) * mag).toLocaleString()
 }
 
@@ -806,7 +809,7 @@ export default function ConfigureScreen() {
                 <div className="bg-amber-950 border border-amber-800 rounded-xl p-4 text-sm space-y-2">
                   <p className="text-amber-300 font-medium">Compute will refuse this configuration</p>
                   <p className="text-amber-700">
-                    It would build about {roundSampled(estimate.projectedCandidates)} pairs to compare,
+                    It would build about {roundSampled(estimate.projectedCandidates, undefined)} pairs to compare,
                     against a limit of {MAX_CANDIDATE_PAIRS.toLocaleString()}. That is every pair the
                     metrics would score, before any threshold — a different and much larger number than
                     the {estimate.count.toLocaleString()} that would reach the review queue.
@@ -855,12 +858,16 @@ export default function ConfigureScreen() {
                 <span className="text-sm text-gray-400">
                   {estimate.exact ? '' : '≈ '}
                   <span className="text-white font-medium">
-                    {estimate.exact ? estimate.count.toLocaleString() : roundSampled(estimate.count)}
+                    {estimate.exact
+                      ? estimate.count.toLocaleString()
+                      : roundSampled(estimate.count, estimate.observed)}
                   </span>{' '}
                   {estimate.count === 1 ? 'pair' : 'pairs'} surfaced by this rule
                   {!estimate.exact && (
                     <span className="text-gray-500">
-                      {' '}— sampled {estimate.sampledNodes?.toLocaleString()} of{' '}
+                      {' '}— projected from {estimate.observed?.toLocaleString()}{' '}
+                      {estimate.observed === 1 ? 'pair' : 'pairs'} seen in a sample of{' '}
+                      {estimate.sampledNodes?.toLocaleString()} of{' '}
                       {estimate.totalNodes?.toLocaleString()} nodes
                     </span>
                   )}
