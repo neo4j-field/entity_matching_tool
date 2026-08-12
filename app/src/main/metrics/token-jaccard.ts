@@ -1,3 +1,4 @@
+import { bestOf, stringValues } from './values'
 import type { MetricModule, PairScore } from './types'
 import { tokenize, tokenBucketPairs } from '../candidate-generator'
 
@@ -10,14 +11,15 @@ export const tokenJaccard: MetricModule = {
   defaultParams: { tokenMode: 'whitespace-lowercase', tokenizer: 'whitespace-lowercase' },
 
   scorePair(a, b, params) {
-    if (typeof a !== 'string' || typeof b !== 'string') return null
     const mode = (params.tokenMode as string) ?? 'whitespace-lowercase'
-    const ta = new Set(tokenize(a, mode))
-    const tb = new Set(tokenize(b, mode))
-    let inter = 0
-    for (const tok of ta) if (tb.has(tok)) inter++
-    const union = ta.size + tb.size - inter
-    return union === 0 ? 0 : inter / union
+    return bestOf(stringValues(a), stringValues(b), (x, y) => {
+      const ta = new Set(tokenize(x, mode))
+      const tb = new Set(tokenize(y, mode))
+      let inter = 0
+      for (const tok of ta) if (tb.has(tok)) inter++
+      const union = ta.size + tb.size - inter
+      return union === 0 ? 0 : inter / union
+    })
   },
 
   async computePairScores(nodes, params, onProgress, signal) {

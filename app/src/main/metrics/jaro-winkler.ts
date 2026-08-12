@@ -1,3 +1,4 @@
+import { bestOf, stringValues } from './values'
 import type { MetricModule, PairScore } from './types'
 import { tokenBucketPairs } from '../candidate-generator'
 
@@ -49,8 +50,10 @@ export const jaroWinklerMetric: MetricModule = {
   defaultParams: { prefixWeight: 0.1 },
 
   scorePair(a, b, params) {
-    if (typeof a !== 'string' || typeof b !== 'string') return null
-    return jaroWinkler(a.toLowerCase(), b.toLowerCase(), (params.prefixWeight as number) ?? 0.1)
+    const p = (params.prefixWeight as number) ?? 0.1
+    return bestOf(stringValues(a), stringValues(b), (x, y) =>
+      jaroWinkler(x.toLowerCase(), y.toLowerCase(), p)
+    )
   },
 
   async computePairScores(nodes, params, onProgress, signal) {

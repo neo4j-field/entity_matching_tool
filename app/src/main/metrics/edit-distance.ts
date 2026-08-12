@@ -1,3 +1,4 @@
+import { bestOf, stringValues } from './values'
 import type { MetricModule, PairScore } from './types'
 import { tokenBucketPairs } from '../candidate-generator'
 
@@ -36,10 +37,12 @@ export const editDistance: MetricModule = {
   defaultParams: { minLen: DEFAULT_MIN_LEN },
 
   scorePair(a, b, params) {
-    if (typeof a !== 'string' || typeof b !== 'string') return null
     const minLen = minLenOf(params)
-    if (a.length < minLen || b.length < minLen) return null
-    return 1 - levenshtein(a, b) / Math.max(a.length, b.length, 1)
+    return bestOf(stringValues(a), stringValues(b), (x, y) =>
+      x.length < minLen || y.length < minLen
+        ? null
+        : 1 - levenshtein(x, y) / Math.max(x.length, y.length, 1)
+    )
   },
 
   async computePairScores(nodes, params, onProgress, signal) {

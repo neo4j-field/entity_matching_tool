@@ -1,3 +1,4 @@
+import { bestOf, numericValues } from './values'
 import type { MetricModule, PairScore } from './types'
 
 export const numericProximity: MetricModule = {
@@ -9,8 +10,9 @@ export const numericProximity: MetricModule = {
   defaultParams: { relativeTolerance: 0.05 },
 
   scorePair(a, b) {
-    if (typeof a !== 'number' || typeof b !== 'number') return null
-    return Math.max(0, 1 - Math.abs(a - b) / Math.max(Math.abs(a), Math.abs(b), 1))
+    return bestOf(numericValues(a), numericValues(b), (x, y) =>
+      Math.max(0, 1 - Math.abs(x - y) / Math.max(Math.abs(x), Math.abs(y), 1))
+    )
   },
 
   async computePairScores(nodes, _params, onProgress, signal) {

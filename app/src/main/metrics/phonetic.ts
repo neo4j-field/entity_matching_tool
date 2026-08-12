@@ -1,3 +1,4 @@
+import { bestOf, stringValues } from './values'
 import type { MetricModule, PairScore } from './types'
 import { MAX_CANDIDATE_PAIRS, CandidateLimitError } from '../candidate-generator'
 
@@ -67,8 +68,9 @@ export const phoneticMetric: MetricModule = {
   defaultParams: {},
 
   scorePair(a, b) {
-    if (typeof a !== 'string' || typeof b !== 'string') return null
-    return metaphone(a) === metaphone(b) ? 1 : 0
+    return bestOf(stringValues(a), stringValues(b), (x, y) =>
+      metaphone(x) === metaphone(y) ? 1 : 0
+    )
   },
 
   async computePairScores(nodes, _params, onProgress, signal) {

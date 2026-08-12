@@ -1,3 +1,4 @@
+import { bestOf, stringValues } from './values'
 import type { MetricModule, PairScore } from './types'
 import { MAX_CANDIDATE_PAIRS, CandidateLimitError } from '../candidate-generator'
 
@@ -20,8 +21,9 @@ export const exactMatch: MetricModule = {
 
   scorePair(a, b, params) {
     const mode = (params.normalization as string) ?? 'nfkd-lower-strip'
-    if (typeof a !== 'string' || typeof b !== 'string') return null
-    return normalize(a, mode) === normalize(b, mode) ? 1 : 0
+    return bestOf(stringValues(a), stringValues(b), (x, y) =>
+      normalize(x, mode) === normalize(y, mode) ? 1 : 0
+    )
   },
 
   async computePairScores(nodes, params, onProgress, signal) {

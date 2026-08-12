@@ -1,3 +1,4 @@
+import { bestOf, stringValues } from './values'
 import type { MetricModule, PairScore } from './types'
 import { tokenize, tokenBucketPairs } from '../candidate-generator'
 
@@ -29,10 +30,9 @@ export const tokenSortRatio: MetricModule = {
   defaultParams: { tokenMode: 'whitespace-lowercase' },
 
   scorePair(a, b, params) {
-    if (typeof a !== 'string' || typeof b !== 'string') return null
     const mode = (params.tokenMode as string) ?? 'whitespace-lowercase'
     const norm = (v: string): string => tokenize(v, mode).sort().join(' ')
-    return sequenceRatio(norm(a), norm(b))
+    return bestOf(stringValues(a), stringValues(b), (x, y) => sequenceRatio(norm(x), norm(y)))
   },
 
   async computePairScores(nodes, params, onProgress, signal) {
