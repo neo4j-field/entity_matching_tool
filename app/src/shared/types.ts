@@ -260,8 +260,18 @@ export interface PairEstimate {
   // Every pair the metrics would score across the whole label, before any
   // threshold. This is the quantity compute's ceiling applies to — not `count`,
   // which counts only pairs that pass the surfacing rule.
+  //
+  // Absent for an incremental capture, which never builds a whole-label pair
+  // set and so has nothing for that ceiling to apply to.
   projectedCandidates?: number
-
+  // True when the estimate describes the next capture pass rather than the whole
+  // label. `count` and `candidates` are then per-pass figures.
+  //
+  // There is deliberately no "passes to finish the label" figure. Pair density
+  // varies by region badly enough that probing Address at several points put it
+  // between 146 and 1,730 passes depending only on the sampling, so any such
+  // number would be authoritative-looking noise.
+  incremental?: boolean
 }
 
 /**

@@ -226,7 +226,8 @@ async function prefixBlockPairs(
   neo4jSession: ReturnType<ReturnType<typeof getDriver>['session']>,
   session: Session,
   pairScores: PairScoreMap,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  batchSize: number = PREFIX_WALK_BATCH
 ): Promise<{ nodes: number; pairs: number; capture: CaptureState }> {
   const field = session.blockingField
   if (!field) throw new Error('Prefix blocking needs a field to block by.')
@@ -300,7 +301,7 @@ async function prefixBlockPairs(
 
   for (;;) {
     if (signal?.aborted) break
-    const result = await neo4jSession.run(q, { cv, cid, batch: int(PREFIX_WALK_BATCH) })
+    const result = await neo4jSession.run(q, { cv, cid, batch: int(batchSize) })
     if (result.records.length === 0) {
       complete = true
       break
@@ -323,7 +324,7 @@ async function prefixBlockPairs(
     // A short batch means the walk ran out of nodes, not out of budget.
     // One batch per call — the capture loop owns the budget, because it is the
     // only place that knows how many pairs actually surfaced.
-    if (result.records.length < PREFIX_WALK_BATCH) complete = true
+    if (result.records.length < batchSize) complete = true
     break
   }
 
@@ -863,6 +864,95 @@ const pairCount = (n: number): number => (n * (n - 1)) / 2
  * the result scaled by C(N,2)/C(n,2) — unbiased in expectation, because a pair
  * survives sampling exactly when both its nodes do.
  */
+/**
+ * Estimate one capture pass by walking a single batch and extrapolating.
+ *
+ * A pass stops on whichever budget binds first, so the useful questions are how
+ * many pairs the next one yields and how many passes the label needs. Both come
+ * from the density of the batch just walked, which is real measurement rather
+ * than a model of a different strategy.
+ */
+async function estimatePrefixPass(
+  neo4jSession: ReturnType<ReturnType<typeof getDriver>['session']>,
+  session: Session,
+  totalNodes: number
+): Promise<PairEstimate> {
+  const signal = new AbortController().signal
+
+  // Sampling only the walk's next batch is structurally optimistic: pair
+  // density rises as a prefix walk moves through the value range. Measured on
+  // Company, consecutive passes yielded 18.3, 35.9 and 60.8 pairs per thousand
+  // nodes, and a head-anchored sample put the label at 26 passes where the
+  // observed density implies about 93. So probe several points across the range
+  // and pool them.
+  // One probe, from wherever the walk currently sits. That is not a compromise:
+  // the next pass starts at exactly this cursor, so local density is the right
+  // thing to measure for predicting it.
+  //
+  // What is deliberately *not* attempted is extrapolating to the whole label.
+  // Density varies enormously by region — probing Address at several lexical
+  // seeds put it anywhere between 146 and 1,730 passes depending only on how
+  // many probes were taken and how deep each one went, and each added probe
+  // seeks a cold part of the index, costing 14-33s for a number with an order
+  // of magnitude of variance in it. Coverage after each real pass is reported
+  // from what was actually walked, which needs no estimate at all.
+  const seeds: (string | null)[] = [session.capture?.cursorValue ?? null]
+
+  let nodesWalked = 0
+  let candidateTotal = 0
+  let observed = 0
+  for (const seed of seeds) {
+    const batchScores: PairScoreMap = new Map()
+    // prefixBlockPairs persists nothing, so probing does not disturb the
+    // session's own cursor.
+    const probe = { ...session, capture: seed === null ? session.capture : {
+      cursorValue: seed, cursorId: '', nodesWalked: 0, complete: false,
+    } }
+    const walked = await prefixBlockPairs(neo4jSession, probe, batchScores, signal)
+    if (walked.nodes === 0 || batchScores.size === 0) continue
+
+    const involved = new Set<string>()
+    for (const { idA, idB } of batchScores.values()) { involved.add(idA); involved.add(idB) }
+    const snapshots = new Map<string, NodeSnapshot>()
+    await loadSnapshots(neo4jSession, involved, snapshots, signal)
+    densify(session, batchScores, snapshots)
+    const fields = fieldPresence(session, snapshots)
+    for (const { idA, idB, scores, abstained } of batchScores.values()) {
+      if (surfaced(scores, session, idA, idB, fields, abstained)) observed++
+    }
+    nodesWalked += walked.nodes
+    candidateTotal += batchScores.size
+  }
+
+  if (nodesWalked === 0 || candidateTotal === 0) {
+    return { count: 0, exact: false, candidates: 0, incremental: true, totalNodes, sampledNodes: nodesWalked }
+  }
+
+  const candidatesPerNode = candidateTotal / nodesWalked
+  const surfacedPerNode = observed / nodesWalked
+  // Whichever budget binds first decides how far a pass gets.
+  const byCandidates = CAPTURE_CANDIDATE_BUDGET / Math.max(candidatesPerNode, 1e-9)
+  const bySurfaced = CAPTURE_SURFACED_BUDGET / Math.max(surfacedPerNode, 1e-9)
+  const walkedSoFar = session.capture?.nodesWalked ?? 0
+  const remaining = Math.max(0, totalNodes - walkedSoFar)
+  const nodesPerPass = Math.max(1, Math.min(byCandidates, bySurfaced, remaining))
+
+  console.log(
+    `[estimate] prefix: ${seeds.length} probes, ${nodesWalked} nodes, ${candidateTotal} candidates, ` +
+      `${observed} surfaced -> ~${Math.round(nodesPerPass)} nodes/pass`
+  )
+
+  return {
+    count: Math.round(surfacedPerNode * nodesPerPass),
+    exact: false,
+    candidates: Math.round(candidatesPerNode * nodesPerPass),
+    observed,
+    sampledNodes: nodesWalked,
+    totalNodes,
+    incremental: true,
+  }
+}
+
 export async function estimateSurfacedPairs(session: Session): Promise<PairEstimate> {
   const driver = getDriver()
   const neo4jSession = driver.session()
@@ -875,6 +965,14 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
     )
     const totalNodes = toJsNumber(countResult.records[0]?.get('total') ?? 0)
     if (totalNodes < 2) return { count: 0, exact: true, candidates: 0 }
+
+    // A prefix capture never builds a whole-label pair set, so projecting one
+    // describes a run that will not happen — it reported 483,339,921 candidates
+    // against the 5,000,000 ceiling for a session that then captured 30,217 in
+    // 27 seconds. What is worth estimating is the next pass.
+    if ((session.blockingStrategy ?? 'auto') === 'prefix') {
+      return await estimatePrefixPass(neo4jSession, session, totalNodes)
+    }
 
     // One scan for the whole label. Per-field queries would give each field its
     // own row set, and ids from different fields cannot be compared.
