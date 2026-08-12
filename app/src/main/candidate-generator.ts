@@ -29,7 +29,14 @@ export interface StringNode {
 export function tokenize(s: string, mode: string): string[] {
   let out = s
   if (mode === 'whitespace-lowercase' || mode === 'alphanumeric') out = out.toLowerCase()
-  if (mode === 'alphanumeric') out = out.replace(/[^a-z0-9\s]/g, ' ')
+  // Unicode-aware, for the same reason as exact-match's normaliser: [^a-z0-9\s]
+  // treats every non-Latin character as punctuation, so "Москва Санкт" produced
+  // no tokens at all and those nodes were invisible to bucketing and scored 0
+  // against everything. Combining marks are dropped rather than spaced, so
+  // "Zürich" stays one token instead of splitting into "z" and "rich".
+  if (mode === 'alphanumeric') {
+    out = out.normalize('NFKD').replace(/\p{M}/gu, '').replace(/[^\p{L}\p{N}\s]/gu, ' ')
+  }
   return out.split(/\s+/).filter(Boolean)
 }
 
