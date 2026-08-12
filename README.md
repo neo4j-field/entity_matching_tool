@@ -132,7 +132,7 @@ Prefix blocking never builds a whole-label pair set, so this ceiling does not ap
 
 **Estimate Pair Count is safe at any label size, and reports what the configured strategy will actually do.** For the in-memory strategies it samples — bounded at 20,000 nodes, thinning from there — and projects a whole-label figure. For prefix blocking it walks one batch from the session's own cursor and reports what the *next pass* will yield, because that is the run that will happen; there is deliberately no "passes to finish the label" figure, since pair density varies by region enough to make any such number authoritative-looking noise.
 
-**Cancel does not interrupt a fetch.** Cancellation is checked between metrics, so during the initial query — the longest phase on a large label — the button has no effect until the query returns.
+**Cancel takes effect during a fetch, but not mid-query.** The per-field result is consumed as a stream and the abort flag is checked every 16,384 rows, so cancelling during the longest phase of a large run stops it rather than waiting for the whole result. A prefix capture checks between batches and keeps everything it captured before the stop.
 
 ---
 
