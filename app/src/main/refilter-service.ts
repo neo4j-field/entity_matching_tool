@@ -51,7 +51,7 @@ export async function refilterPairs(session: Session, signal?: AbortSignal): Pro
   }
 
   console.log(`[refilter] read ${pairs.length} pairs and ${scoreRows.length} scores in ${Date.now() - t0}ms`)
-  const result: RefilterResult = { surfaced: 0, added: 0, removed: 0, keptForVerdict: 0 }
+  const result: RefilterResult = { surfaced: 0, added: 0, removed: 0, keptForVerdict: 0, repaired: 0 }
   const toHydrate: { pairId: string; idA: string; idB: string }[] = []
   const updates: { id: string; surfaced: number }[] = []
 
@@ -75,6 +75,19 @@ export async function refilterPairs(session: Session, signal?: AbortSignal): Pro
     }
 
     if (nowSurfaced) result.surfaced++
+
+    // Snapshots written before temporal values were converted hold the driver's
+    // internal shape and display as "[object Object]". Re-fetching is the only
+    // repair — the stored form has lost the type that says how to read it. A
+    // resumed capture never revisits nodes it has already walked, so without
+    // this those pairs would carry it for the life of the session.
+    if (nowSurfaced && wasSurfaced && hasLegacyTemporal(row.node_a_json as string, row.node_b_json as string)) {
+      const a = JSON.parse(row.node_a_json as string) as NodeSnapshot
+      const b = JSON.parse(row.node_b_json as string) as NodeSnapshot
+      toHydrate.push({ pairId: id, idA: a.id, idB: b.id })
+      result.repaired++
+    }
+
     if (nowSurfaced !== wasSurfaced) {
       updates.push({ id, surfaced: nowSurfaced ? 1 : 0 })
       if (nowSurfaced) {
@@ -112,6 +125,13 @@ export async function refilterPairs(session: Session, signal?: AbortSignal): Pro
     console.log(`[refilter] hydrated ${toHydrate.length} pairs in ${Date.now() - t}ms`)
   }
   return result
+}
+
+// A neo4j.Integer serialises as {"low":n,"high":n}, and a temporal value is a
+// bag of them. No ordinary property produces that shape, so its presence in the
+// stored JSON identifies a snapshot written before the conversion existed.
+function hasLegacyTemporal(nodeAJson: string, nodeBJson: string): boolean {
+  return nodeAJson.includes('"low":') || nodeBJson.includes('"low":')
 }
 
 // Pairs entering the queue for the first time have no stored snapshots — only

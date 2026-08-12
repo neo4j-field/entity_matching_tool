@@ -286,6 +286,9 @@ export interface RefilterResult {
   // Pairs a raised threshold would have excluded but that carry a verdict, so
   // they stay in the queue rather than hiding work someone already did.
   keptForVerdict: number
+  // Pairs whose stored snapshots were re-fetched because they predate temporal
+  // conversion and were displaying as "[object Object]".
+  repaired: number
 }
 
 // ─── Merge ───────────────────────────────────────────────────────────────────

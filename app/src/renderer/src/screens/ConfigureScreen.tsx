@@ -376,9 +376,10 @@ export default function ConfigureScreen() {
       const result = await window.api.pairs.refilter(session.id)
       setSession(updated)
       setPairs(await window.api.pairs.list(session.id))
+      const repaired = result.repaired > 0 ? `, ${result.repaired} refreshed from the graph` : ''
       const kept = result.keptForVerdict > 0 ? `, ${result.keptForVerdict} kept for their verdict` : ''
       addToast(
-        `${result.surfaced.toLocaleString()} pairs in the queue — ${result.added} added, ${result.removed} removed${kept}`,
+        `${result.surfaced.toLocaleString()} pairs in the queue — ${result.added} added, ${result.removed} removed${kept}${repaired}`,
         'success'
       )
       setScreen('review')
