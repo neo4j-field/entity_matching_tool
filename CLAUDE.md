@@ -98,7 +98,15 @@ useEffect(() => {
 
 **ONNX Runtime batch size** — the BGE semantic cosine pipeline crashes (`EXC_BREAKPOINT` in `AllocateMLValueTensorSelfOwnBufferHelper`) if given too many inputs at once. Hard limit: `BGE_BATCH_SIZE = 16`. The pipeline is cached as a module-level singleton (`bgeExtractor`) — do not re-instantiate per call. Input strings are truncated to 2000 chars before encoding.
 
-**Neo4j Integer handling** — the Neo4j driver v6 returns `neo4j.Integer` for integer fields; these are not JS numbers. Use the `sanitize()` helper in `app/src/main/neo4j-int.ts` to convert before serialising to the renderer.
+**Neo4j value conversion** — the driver returns `neo4j.Integer` for integer
+fields, and temporal and spatial values as objects whose meaning lives entirely
+in their prototype's `toString()`. Structured clone strips that prototype, so an
+unconverted `Date` reaches the renderer as `{year:{low,high},...}` and displays
+as `[object Object]`. `sanitize()` in `app/src/main/neo4j-int.ts` handles both,
+plus nested objects and lists — use it on anything crossing IPC. It must run in
+main, while the prototype still exists. Relationship properties in
+`merge-executor.ts` are deliberately *not* sanitised: they go straight back to
+Neo4j as write parameters, where the driver types are correct.
 
 **Cancellable async loops** — use a module-level flag (`autoClassifyCancelled`) checked at the top of each loop iteration. Do not try to cancel mid-API-call; let the in-flight request finish, then stop. Return `{ classified, cancelled }` so the renderer can show a partial-result banner.
 
@@ -119,6 +127,17 @@ every pair before returning, so a wide configuration dies in there first — on 
 size exceeded". `tokenBucketPairs`, `exact-match`, `phonetic`, and
 `semantic-cosine` each enforce it; a new pair-producing path must too.
 
+**Blocking silently caps recall, in two places** — both are the mechanism that
+keeps a dense block from exploding, and both drop real comparisons without an
+error. `tokenBucketPairs` discards any token shared by more than `maxBucketSize`
+(500) values, so a word common enough to be useless as a key stops blocking
+altogether: two records whose only shared word is `LIMITED` are never compared.
+`prefixBlockPairs` keeps at most `PREFIX_BLOCK_LIMIT` (50) partners per node, so
+on a prefix thousands of nodes share, the rest are never offered — which is also
+why a short prefix on a low-cardinality property finds little. Neither is a bug;
+both need to stay in mind when a duplicate "should have been caught". Changing
+either changes what every existing session would surface.
+
 **Pair ids are session-scoped** — `pairIdFor(sessionId, idA, idB)` in
 `app/src/main/pair-id.ts`. `pairs.id` is the primary key, so an id built from
 the node ids alone is shared by every session comparing those two nodes against
@@ -130,6 +149,32 @@ exposure through its `(pair_id, ...)` key, so the later session also overwrote
 the earlier one's scores. `upsertPairs` still recognises the unscoped id within
 the same session so recompute updates pre-scoping rows rather than duplicating
 them; that shim and `legacyPairId` can go once no such session remains.
+
+**Capture state is the contract for prefix mode** — `CaptureState` on the session
+(`cursorValue`, `cursorId`, `nodesWalked`, `complete`, `fingerprint`) is what
+makes a walk resumable, and every part of it earns its place. The cursor is a
+`(value, elementId)` pair because a batch boundary can fall inside a run of equal
+values and resuming from the value alone skips every node sharing it. The
+fingerprint covers fields, metric params, and the blocking key but *not*
+thresholds — a walk stays valid across a threshold change and does not across a
+field change. A `complete` capture is restarted rather than resumed: resuming a
+spent cursor re-walked the label while adding to the old count (1,533 nodes on a
+511-node label, and coverage past 100%).
+
+The renderer's copy of the session goes stale the moment compute persists a
+cursor, so anything that saves a session after a run must reload it first —
+`ComputeScreen.proceed()` spreads its copy over a save and would otherwise write
+the pre-run cursor back.
+
+**Scores are stored for candidates that did not surface** — `pairs.surfaced = 0`,
+with ids and scores but empty node snapshots (storing snapshots for all of them
+costs 116 MB per pass on a 6.3M-node label against 12 MB). `listPairs` returns
+only surfaced rows; `refilter-service.ts` re-applies the surfacing rule to the
+stored scores and hydrates a promoted pair from the graph. `applySurfacingRule`
+is shared by compute and re-filter, parameterised by a `comparable` predicate,
+because a re-filter reading SQLite cannot know which nodes carried which property
+— after `densify()` a field has a score row under exactly that condition. If the
+two ever disagree, a re-filter stops reproducing compute's own verdict.
 
 **Re-run compute** — detected via `session.status === 'reviewing' | 'merges-applied'` in ConfigureScreen. Uses `session.save` instead of `session.create`. The `upsertPairs` SQL uses `ON CONFLICT(id) DO UPDATE SET` but intentionally does **not** overwrite `verdict`, `decided_at`, or `note` — existing verdicts are preserved across recomputes.
 
