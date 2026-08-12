@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto'
 import { legacyPairId } from './pair-id'
-import { getDb } from './db'
+import { getDb, reclaimUnusedSpace } from './db'
 import type { Session, CandidatePair, DecidedBy, MetricScore, Verdict } from '../shared/types'
 
 // ── Sessions ──────────────────────────────────────────────────────────────────
@@ -97,6 +97,10 @@ export function saveSession(session: Session): void {
 
 export function deleteSession(id: string): void {
   getDb().prepare('DELETE FROM sessions WHERE id = ?').run(id)
+  // Cascades clear the session's pairs, scores and audit records, but SQLite
+  // keeps the pages. Deleting a session is the one moment a large amount of
+  // space becomes free at once, so it is where reclaiming belongs.
+  reclaimUnusedSpace()
 }
 
 // ── Pairs ─────────────────────────────────────────────────────────────────────

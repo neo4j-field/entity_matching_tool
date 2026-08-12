@@ -14,6 +14,56 @@ export function getDb(): Database.Database {
   return _db
 }
 
+// SQLite never returns freed pages to the filesystem on its own — a deleted
+// session's rows become reusable space inside the file, and the file stays the
+// size it grew to. Storing candidates that did not surface makes that gap wider,
+// because a capture writes far more rows than reach the queue.
+//
+// Only worth the rewrite when there is something real to reclaim: VACUUM copies
+// every live page, so running it after every delete would rewrite the database
+// to recover a few kilobytes.
+const VACUUM_MIN_FREE_BYTES = 64 * 1024 * 1024
+
+/**
+ * Return unused space to the filesystem, if there is enough of it to be worth
+ * rewriting the database for. Returns the bytes reclaimed, or 0 if it declined.
+ *
+ * VACUUM cannot run inside a transaction, and needs another connection to be
+ * idle — a second one holding the write lock makes it fail rather than corrupt
+ * anything, so the caller treats failure as "not now" and moves on.
+ */
+export function reclaimUnusedSpace(): number {
+  const db = getDb()
+  const pragma = (name: string): number =>
+    Object.values(db.prepare(`PRAGMA ${name}`).get() as Record<string, number>)[0]
+
+  const pageSize = pragma('page_size')
+  const freeBytes = pragma('freelist_count') * pageSize
+  if (freeBytes < VACUUM_MIN_FREE_BYTES) return 0
+
+  const before = pragma('page_count') * pageSize
+  const started = Date.now()
+  try {
+    db.exec('VACUUM')
+  } catch (err) {
+    console.log(`[db] vacuum skipped: ${(err as Error).message}`)
+    return 0
+  }
+  // VACUUM alone returns nothing to the filesystem in WAL mode: it rebuilds the
+  // database through the write-ahead log, and the main file keeps its old size
+  // until a checkpoint truncates it. Measured on a 171.1 MB database emptied to
+  // 0.7 MB of live rows: after VACUUM the file was still 171.1 MB, and only the
+  // checkpoint brought it to 0.7 MB.
+  db.pragma('wal_checkpoint(TRUNCATE)')
+
+  const after = pragma('page_count') * pageSize
+  console.log(
+    `[db] vacuum reclaimed ${((before - after) / 1e6).toFixed(1)} MB ` +
+      `(${(before / 1e6).toFixed(1)} -> ${(after / 1e6).toFixed(1)} MB) in ${Date.now() - started}ms`
+  )
+  return before - after
+}
+
 function migrate(db: Database.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions (
