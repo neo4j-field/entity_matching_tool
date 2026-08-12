@@ -160,6 +160,25 @@ export interface ScorePercentiles {
 export interface ScoreDistributions {
   all: ScorePercentiles[]
   pending: ScorePercentiles[]
+  candidates?: CandidateSummary
+}
+
+/**
+ * How the run decided which pairs were worth scoring.
+ *
+ * This was previously invisible. A run either compared everything or compared
+ * only pairs sharing a token — discarding any token shared by more than
+ * `maxBucketSize` values — and nothing distinguished the two or reported what
+ * the second had dropped. That is the single largest determinant of what
+ * reaches the queue, so it belongs in the result rather than in a constant.
+ */
+export interface CandidateSummary {
+  strategy: 'exhaustive' | 'token-bucket'
+  nodes: number
+  // Pairs that reached scoring.
+  pairs: number
+  // Only meaningful for 'exhaustive': every pair of the label was compared.
+  complete: boolean
 }
 
 export interface PairEstimate {

@@ -140,6 +140,34 @@ export default function ComputeScreen() {
           </div>
         )}
 
+        {/* How candidates were chosen — the largest single determinant of what
+            reaches the queue, and previously not reported at all. */}
+        {done && dists?.candidates && (
+          <div className="bg-gray-900 border border-gray-800 rounded-xl px-4 py-3 space-y-1">
+            <p className="text-sm text-white">
+              {dists.candidates.strategy === 'exhaustive'
+                ? 'Every pair was compared'
+                : 'Pairs sharing a word were compared'}
+            </p>
+            <p className="text-xs text-gray-400">
+              {dists.candidates.strategy === 'exhaustive' ? (
+                <>
+                  {dists.candidates.nodes.toLocaleString()} nodes,{' '}
+                  {dists.candidates.pairs.toLocaleString()} pairs — small enough to compare
+                  completely, so nothing was ruled out before scoring.
+                </>
+              ) : (
+                <>
+                  {dists.candidates.pairs.toLocaleString()} pairs scored across{' '}
+                  {dists.candidates.nodes.toLocaleString()} nodes. Two records that share no word on
+                  any field were never compared, so duplicates spelled differently enough will not
+                  appear here.
+                </>
+              )}
+            </p>
+          </div>
+        )}
+
         {/* Score distributions with histograms */}
         {done && dists && (
           <div className="space-y-4">

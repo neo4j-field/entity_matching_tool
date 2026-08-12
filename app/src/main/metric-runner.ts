@@ -11,6 +11,7 @@ import type {
   ScoreDistributions,
   ScorePercentiles,
   PairEstimate,
+  CandidateSummary,
 } from '../shared/types'
 import type { NodeRecord } from './metrics/types'
 
@@ -61,8 +62,8 @@ export async function runMetrics(
     const exhaustive = await seedExhaustivePairs(neo4jSession, session, pairScores)
     if (exhaustive !== null) {
       console.log(
-        `[compute] exhaustive: ${exhaustive.nodes} nodes -> ` +
-          `${exhaustive.pairs.toLocaleString()} pairs seeded, every pair will be compared`
+        `[compute] candidates: exhaustive — ${exhaustive.nodes} nodes, ` +
+          `${exhaustive.pairs.toLocaleString()} pairs, every pair compared`
       )
     }
     for (const fieldConfig of session.fields) {
@@ -188,7 +189,22 @@ export async function runMetrics(
     const dists = computeDistributions(pairScores)
     console.log(`[compute] computeDistributions: ${Date.now() - t}ms`)
 
-    return dists
+    const candidates: CandidateSummary = exhaustive
+      ? { strategy: 'exhaustive', nodes: exhaustive.nodes, pairs: pairScores.size, complete: true }
+      : {
+          strategy: 'token-bucket',
+          nodes: Math.max(0, ...[...fieldNodeIds.values()].map((ids) => ids.size)),
+          pairs: pairScores.size,
+          complete: false,
+        }
+    if (!exhaustive) {
+      console.log(
+        `[compute] candidates: token-bucket — ${candidates.pairs.toLocaleString()} pairs from ` +
+          `${candidates.nodes.toLocaleString()} nodes; pairs sharing no token were never compared`
+      )
+    }
+
+    return { ...dists, candidates }
   } finally {
     // Fire-and-forget — session.close() involves a network round-trip to Aura;
     // awaiting it would stall the caller after all real work is done.
