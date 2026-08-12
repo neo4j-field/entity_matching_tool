@@ -44,6 +44,27 @@ export async function runMetrics(
   const fieldNodeIds = new Map<string, Set<string>>()
 
   try {
+    // Candidate generation, made explicit.
+    //
+    // Metrics decide which pairs are worth scoring by bucketing, and a pair that
+    // no metric buckets together is never scored by anything. That is a recall
+    // decision, and on a label small enough to compare completely it is one
+    // nobody should be paying. Measured on a 244-node label: 28,822 of 29,646
+    // possible pairs were considered and 824 — 2.8% — were never scored at all,
+    // because they shared no token, no exact value and no phonetic code on any
+    // field.
+    //
+    // So when the label is small enough to afford it, seed every pair up front.
+    // densify() fills in each field's scores for pairs it finds already present,
+    // which turns that seeding into a complete comparison without touching a
+    // single metric.
+    const exhaustive = await seedExhaustivePairs(neo4jSession, session, pairScores)
+    if (exhaustive !== null) {
+      console.log(
+        `[compute] exhaustive: ${exhaustive.nodes} nodes -> ` +
+          `${exhaustive.pairs.toLocaleString()} pairs seeded, every pair will be compared`
+      )
+    }
     for (const fieldConfig of session.fields) {
       for (const metricConfig of fieldConfig.metrics) {
         // Signal that this metric has started so the UI shows it at 0% immediately
@@ -173,6 +194,45 @@ export async function runMetrics(
     // awaiting it would stall the caller after all real work is done.
     neo4jSession.close().catch(() => {})
   }
+}
+
+// Comparing every pair costs ~325 bytes each while a run is in progress, so
+// exhaustive mode is only offered where that is comfortably affordable. Above
+// this the existing per-metric bucketing decides candidates, as it always has.
+const EXHAUSTIVE_PAIR_LIMIT = 500_000
+
+/**
+ * Seeds every pair of the label when it is small enough to compare completely.
+ *
+ * Returns null when the label is too large, leaving candidate generation to the
+ * metrics. Scores are not written here — densify() fills them in, which is what
+ * makes this a strategy rather than a special case.
+ */
+async function seedExhaustivePairs(
+  neo4jSession: ReturnType<ReturnType<typeof getDriver>['session']>,
+  session: Session,
+  pairScores: PairScoreMap
+): Promise<{ nodes: number; pairs: number } | null> {
+  const counted = await neo4jSession.run(
+    `MATCH (n:\`${session.label}\`) RETURN count(n) AS total`
+  )
+  const total = toJsNumber(counted.records[0]?.get('total') ?? 0)
+  if (total < 2 || pairCount(total) > EXHAUSTIVE_PAIR_LIMIT) return null
+
+  const ids: string[] = []
+  for await (const r of neo4jSession.run(
+    `MATCH (n:\`${session.label}\`) RETURN elementId(n) AS id`
+  )) {
+    ids.push(r.get('id') as string)
+  }
+
+  for (let i = 0; i < ids.length; i++) {
+    for (let j = i + 1; j < ids.length; j++) {
+      const pairId = pairIdFor(session.id, ids[i], ids[j])
+      if (!pairScores.has(pairId)) pairScores.set(pairId, { idA: ids[i], idB: ids[j], scores: [] })
+    }
+  }
+  return { nodes: ids.length, pairs: pairScores.size }
 }
 
 // Loads full property maps for a set of node ids, in batches.
