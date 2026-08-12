@@ -1,3 +1,26 @@
+import { MAX_CANDIDATE_PAIRS } from '../shared/constants'
+export { MAX_CANDIDATE_PAIRS }
+
+// Ceiling on candidate pairs from a single metric on a single field.
+//
+// This has to be enforced here rather than by the caller. Candidate generation
+// materialises every pair before returning, so a configuration wide enough to
+// matter dies inside this function — on a 647k-node label a token metric hit
+// V8's own ~16.7M-entry Set limit and threw "Set maximum size exceeded", which
+// tells the user nothing about what they configured.
+export class CandidateLimitError extends Error {
+  constructor() {
+    super(
+      `This configuration produces more than ${MAX_CANDIDATE_PAIRS.toLocaleString()} candidate pairs. ` +
+        `to compare. That is every pair the metrics would score, before any threshold is ` +
+        `applied, so it is far larger than the number that would reach the review queue. ` +
+        `Remove a field or a metric, or narrow the label — raising a threshold does not help, ` +
+        `because thresholds are applied after these pairs are built.`
+    )
+    this.name = 'CandidateLimitError'
+  }
+}
+
 export interface StringNode {
   id: string
   value: string
@@ -36,6 +59,7 @@ export function tokenBucketPairs(nodes: StringNode[], maxBucketSize = 500): [str
         if (ids[i] === ids[j]) continue
         const key = ids[i] < ids[j] ? `${ids[i]}|${ids[j]}` : `${ids[j]}|${ids[i]}`
         if (!seen.has(key)) {
+          if (pairs.length >= MAX_CANDIDATE_PAIRS) throw new CandidateLimitError()
           seen.add(key)
           pairs.push(ids[i] < ids[j] ? [ids[i], ids[j]] : [ids[j], ids[i]])
         }

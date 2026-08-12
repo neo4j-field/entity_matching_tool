@@ -1,4 +1,5 @@
 import type { MetricModule, PairScore } from './types'
+import { MAX_CANDIDATE_PAIRS, CandidateLimitError } from '../candidate-generator'
 
 function normalize(s: string, mode: string): string {
   if (mode === 'none') return s
@@ -45,6 +46,7 @@ export const exactMatch: MetricModule = {
       if (signal?.aborted) break
       for (let i = 0; i < ids.length; i++) {
         for (let j = i + 1; j < ids.length; j++) {
+          if (results.length >= MAX_CANDIDATE_PAIRS) throw new CandidateLimitError()
           results.push({ idA: ids[i], idB: ids[j], score: 1.0 })
         }
       }

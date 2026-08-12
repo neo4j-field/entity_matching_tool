@@ -102,6 +102,23 @@ useEffect(() => {
 
 **Cancellable async loops** — use a module-level flag (`autoClassifyCancelled`) checked at the top of each loop iteration. Do not try to cancel mid-API-call; let the in-flight request finish, then stop. Return `{ classified, cancelled }` so the renderer can show a partial-result banner.
 
+**Compute's memory model** — `runMetrics` holds one `(id, value)` per node per
+field while scoring (~250 bytes/node measured), never full property maps. Those
+are re-fetched afterwards by `loadSnapshots`, only for nodes that appear in a
+candidate pair — a `NodeByElementIdSeek`, so it is a seek not a scan. Selecting
+`properties(n)` in the per-field fetch, as it once did, costs ~900 bytes/node and
+does not fit a multi-million-node label. The per-field result is consumed as an
+async stream rather than `result.records` so the driver's record objects are
+released as they are read.
+
+The other axis is candidate pairs, ~325 bytes each while in flight.
+`MAX_CANDIDATE_PAIRS` in `candidate-generator.ts` caps it at 5M, enforced
+*inside* candidate generation rather than by the caller: metrics materialise
+every pair before returning, so a wide configuration dies in there first — on a
+647k-node label it hit V8's own ~16.7M-entry `Set` limit and threw "Set maximum
+size exceeded". `tokenBucketPairs`, `exact-match`, `phonetic`, and
+`semantic-cosine` each enforce it; a new pair-producing path must too.
+
 **Pair ids are session-scoped** — `pairIdFor(sessionId, idA, idB)` in
 `app/src/main/pair-id.ts`. `pairs.id` is the primary key, so an id built from
 the node ids alone is shared by every session comparing those two nodes against
