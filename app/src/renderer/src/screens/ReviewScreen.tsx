@@ -749,6 +749,22 @@ export default function ReviewScreen() {
           )}
         </div>
 
+        {/* A partial capture stopped on a budget, not at the end of the label.
+            Saying so where the queue is counted keeps "0 pending" from reading
+            as "this label is deduplicated". */}
+        {session.capture && !session.capture.complete && (
+          <div className="px-3 py-3 border-t border-gray-800 space-y-2">
+            <p className="text-xs text-amber-300">Partial capture</p>
+            <p className="text-[11px] text-gray-500 leading-relaxed">
+              {session.capture.nodesWalked.toLocaleString()} nodes walked so far. Later nodes have
+              not been compared yet, so this queue is not the whole label.
+            </p>
+            <button onClick={() => setScreen('compute')} className="w-full btn-secondary text-xs">
+              Capture more
+            </button>
+          </div>
+        )}
+
         {/* Export */}
         <div className="px-3 py-3 border-t border-gray-800 space-y-1">
           <button onClick={() => exportPairs('csv')} disabled={exporting} className="w-full btn-ghost text-xs">
