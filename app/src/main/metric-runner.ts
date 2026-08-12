@@ -233,6 +233,23 @@ async function prefixBlockPairs(
     )
   }
 
+  // In this mode densify() produces every score, and it can only ask metrics
+  // that expose scorePair. A metric without one would contribute nothing, the
+  // field would look unjudgeable, and All mode would quietly drop it — the same
+  // silent narrowing that #23 describes, arriving through a different door.
+  // Refuse the configuration instead of returning a rule narrower than the one
+  // on screen.
+  const unscorable = session.fields.flatMap((f) =>
+    f.metrics.filter((m) => !getMetric(m.metricId).scorePair).map((m) => `${f.propertyName} · ${m.metricId}`)
+  )
+  if (unscorable.length > 0) {
+    throw new Error(
+      `Prefix blocking cannot score ${unscorable.join(', ')}. That metric compares whole sets of ` +
+        `nodes at once rather than one pair at a time, so this strategy would leave those fields ` +
+        `unscored and drop them from the rule. Remove the metric, or choose another strategy.`
+    )
+  }
+
   const prefix = Math.max(1, session.blockingPrefixLength ?? DEFAULT_PREFIX_LENGTH)
   const q =
     `MATCH (n:\`${session.label}\`) WHERE n.\`${field}\` IS NOT NULL
