@@ -22,7 +22,15 @@ export interface PropertyMeta {
   mandatory: boolean
   inferredKind: PropertyKind
   sampleValues: unknown[]
+  // Online indexes covering this property alone. Blocking strategies that ask
+  // the database which nodes look like a given node need one of these, and
+  // wrapping the property in a function loses the seek — `n.p STARTS WITH $x`
+  // plans as NodeIndexSeekByRange while `toLower(n.p) STARTS WITH $x` falls
+  // back to a full label scan.
+  indexes?: PropertyIndexKind[]
 }
+
+export type PropertyIndexKind = 'RANGE' | 'TEXT' | 'POINT' | 'FULLTEXT' | 'VECTOR'
 
 export interface LabelMeta {
   name: string

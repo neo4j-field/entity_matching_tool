@@ -2,7 +2,14 @@ import { getDriver } from './connection-service'
 import { mapWithConcurrency } from './concurrency'
 import { getSettings } from './settings-service'
 import { toJsNumber, sanitize } from './neo4j-int'
-import type { SchemaModel, LabelMeta, PropertyMeta, PropertyKind, RelTypeMeta } from '../shared/types'
+import type {
+  SchemaModel,
+  LabelMeta,
+  PropertyMeta,
+  PropertyKind,
+  PropertyIndexKind,
+  RelTypeMeta,
+} from '../shared/types'
 
 let _cached: SchemaModel | null = null
 
@@ -36,6 +43,36 @@ export async function discoverSchema(): Promise<SchemaModel> {
       queryCount++
       apocAvailable = true
     } catch { /* not available */ }
+
+    // Which properties the database can seek on. Read-only, and cheap — the
+    // index list is metadata, not a scan. Nothing is ever created here: an
+    // index outlives the session, taxes every write to its label for as long as
+    // it exists, and belongs to whoever owns the database.
+    const indexed = new Map<string, Map<string, Set<PropertyIndexKind>>>()
+    try {
+      const idxResult = await session.run(`
+        SHOW INDEXES YIELD name, type, entityType, labelsOrTypes, properties, state
+        WHERE entityType = 'NODE' AND state = 'ONLINE'
+        RETURN type, labelsOrTypes, properties
+      `)
+      queryCount++
+      for (const record of idxResult.records) {
+        const kind = record.get('type') as PropertyIndexKind
+        const labels = (record.get('labelsOrTypes') ?? []) as string[]
+        const props = (record.get('properties') ?? []) as string[]
+        // A composite index only supports a seek on its leading property, and a
+        // full-text index spans every property it names.
+        const usable = kind === 'FULLTEXT' ? props : props.slice(0, 1)
+        for (const label of labels) {
+          if (!indexed.has(label)) indexed.set(label, new Map())
+          const forLabel = indexed.get(label)!
+          for (const prop of usable) {
+            if (!forLabel.has(prop)) forLabel.set(prop, new Set())
+            forLabel.get(prop)!.add(kind)
+          }
+        }
+      }
+    } catch { /* SHOW INDEXES unavailable — strategies needing one stay hidden */ }
 
     // Property types, from whichever source can answer without reading the
     // whole store.
@@ -210,6 +247,8 @@ export async function discoverSchema(): Promise<SchemaModel> {
         }
         meta.sampleValues = values
         meta.inferredKind = inferKind(meta)
+        const idx = indexed.get(label)?.get(propName)
+        if (idx && idx.size > 0) meta.indexes = [...idx]
         propMetas.push(meta)
       }
       labels.push({ name: label, count: countsMap[label] ?? 0, properties: propMetas })
