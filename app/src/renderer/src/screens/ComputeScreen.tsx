@@ -96,9 +96,12 @@ export default function ComputeScreen() {
   // covers pairs on both sides. After k of N nodes the reachable share of pairs
   // is 1 - (1 - k/N)^2 — well ahead of k/N, which is why a partial capture is
   // worth reviewing rather than a fraction of an answer.
+  // Clamped because the two figures come from different moments: nodesWalked is
+  // from the walk, labelCount from the last schema discovery, and merges shrink
+  // the label in between.
   const coveragePct =
     labelCount && capture
-      ? (100 * (1 - Math.pow(1 - capture.nodesWalked / labelCount, 2))).toFixed(1)
+      ? Math.min(100, 100 * (1 - Math.pow(1 - Math.min(1, capture.nodesWalked / labelCount), 2))).toFixed(1)
       : '0'
 
   const entries = Array.from(progress.values())

@@ -120,6 +120,14 @@ export type BlockingStrategy = 'auto' | 'exhaustive' | 'token-bucket' | 'prefix'
  * correct, but "this label has been deduplicated" stops being true, and nothing
  * downstream can tell the difference without being told.
  */
+/*
+ * A merge between passes can delete the node the cursor names. That is safe:
+ * the resume predicate compares the stored value and elementId and never looks
+ * the cursor node up, so a vanished one still orders the walk. Nodes sharing
+ * its value may be offered a second time, which the upsert absorbs; none is
+ * ever skipped. Verified against a cursor naming an elementId that does not
+ * exist.
+ */
 export interface CaptureState {
   cursorValue: string | null
   cursorId: string | null
