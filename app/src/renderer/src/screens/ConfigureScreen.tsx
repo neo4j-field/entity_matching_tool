@@ -65,6 +65,8 @@ export default function ConfigureScreen() {
   const [fieldSurfacing, setFieldSurfacing] = useState<Record<string, { threshold: number; weight: number }>>({})
   const [combinedThreshold, setCombinedThreshold] = useState(0.85)
   const [blocking, setBlocking] = useState<BlockingStrategy>('auto')
+  const [blockingField, setBlockingField] = useState<string>('')
+  const [prefixLength, setPrefixLength] = useState(8)
   const [estimate, setEstimate] = useState<PairEstimate | null>(null)
   const [estimating, setEstimating] = useState(false)
   const [creating, setCreating] = useState(false)
@@ -78,10 +80,24 @@ export default function ConfigureScreen() {
   const hasApiKey = Boolean(settings?.anthropicApiKey)
   const weightTotal = Object.values(fieldSurfacing).reduce((sum, cfg) => sum + cfg.weight, 0)
 
+  // A prefix predicate has to touch the raw property, so it needs an index that
+  // supports a range seek. Anything else means a full label scan per node.
+  const seekable = (selectedLabel?.properties ?? []).filter((p) =>
+    p.indexes?.some((k) => k === 'RANGE' || k === 'TEXT')
+  )
+  // semantic-cosine scores whole sets rather than single pairs, and prefix
+  // blocking scores pair by pair, so the two cannot be combined.
+  const setScoringMetrics = fields
+    .filter((f) => f.enabled)
+    .flatMap((f) => f.metrics.filter((m) => m.metricId === 'semantic-cosine').map(() => f.propertyName))
+
   const labelNodes = selectedLabel?.count ?? 0
   const projectedGb = (labelNodes * BYTES_PER_NODE) / 1_073_741_824
   const isExtremeLabel = labelNodes >= EXTREME_LABEL_NODES
   const blockedByLabelSize = isExtremeLabel && !acceptLargeLabel
+  // Compute refuses this combination, so refuse it here rather than letting the
+  // run fail partway through.
+  const blockedByStrategy = blocking === 'prefix' && setScoringMetrics.length > 0
 
   useEffect(() => {
     const off = window.api.usage.onCall((record) => {
@@ -140,6 +156,8 @@ export default function ConfigureScreen() {
     }
     setFieldSurfacing(sf)
     setBlocking(session!.blockingStrategy ?? 'auto')
+    setBlockingField(session!.blockingField ?? '')
+    setPrefixLength(session!.blockingPrefixLength ?? 8)
     setSurfacingMode(session!.surfacingRule.mode)
     if (session!.surfacingRule.combinedThreshold != null) {
       setCombinedThreshold(session!.surfacingRule.combinedThreshold)
@@ -283,6 +301,9 @@ export default function ConfigureScreen() {
       label: selectedLabel!.name,
       fields: fieldConfigs,
       surfacingRule,
+      blockingStrategy: blocking,
+      blockingField: blocking === 'prefix' ? blockingField || seekable[0]?.name : undefined,
+      blockingPrefixLength: blocking === 'prefix' ? prefixLength : undefined,
       status: 'configuring' as const,
       reviewCursor: 0,
       reviewFilter: { verdict: 'all' as const },
@@ -343,6 +364,9 @@ export default function ConfigureScreen() {
           ...session,
           fields: partial.fields,
           surfacingRule: partial.surfacingRule,
+          blockingStrategy: partial.blockingStrategy,
+          blockingField: partial.blockingField,
+          blockingPrefixLength: partial.blockingPrefixLength,
           updatedAt: new Date().toISOString(),
         }
         await window.api.session.save(activeSession)
@@ -818,6 +842,9 @@ export default function ConfigureScreen() {
                 ['auto', 'Automatic', `Compare everything when the label is small enough, otherwise compare pairs sharing a word.`],
                 ['exhaustive', 'Every pair', `Nothing is ruled out before scoring. Finds pairs that share no word — which token comparison can never offer — at roughly twice the time and several times the memory. ${labelNodes > 0 ? `${labelNodes.toLocaleString()} nodes is ${Math.round((labelNodes * (labelNodes - 1)) / 2).toLocaleString()} comparisons.` : ''}`],
                 ['token-bucket', 'Pairs sharing a word', 'Only records with a word in common are compared. Fast on any label size, but two records spelled differently enough are never offered.'],
+                ['prefix', 'Records starting the same way', seekable.length === 0
+                  ? 'Needs an indexed property to look up by, and this label has none. Without an index the database scans every node for every node.'
+                  : 'The database finds candidates instead of loading the label into memory — the only option that stays workable on millions of nodes. Only records whose chosen property starts identically are compared, and the comparison is case-sensitive.'],
               ] as [BlockingStrategy, string, string][]).map(([value, title, detail]) => (
                 <label key={value} className="flex items-start gap-3 cursor-pointer">
                   <input
@@ -825,6 +852,7 @@ export default function ConfigureScreen() {
                     name="blocking"
                     className="mt-1"
                     checked={blocking === value}
+                    disabled={value === 'prefix' && seekable.length === 0}
                     onChange={() => setBlocking(value)}
                   />
                   <span className="min-w-0">
@@ -833,6 +861,54 @@ export default function ConfigureScreen() {
                   </span>
                 </label>
               ))}
+
+              {blocking === 'prefix' && seekable.length > 0 && (
+                <div className="border-t border-gray-800 pt-3 space-y-3">
+                  <label className="flex items-center gap-3 text-xs text-gray-400">
+                    <span className="w-28 shrink-0">Look up by</span>
+                    <select
+                      value={blockingField || seekable[0].name}
+                      onChange={(e) => setBlockingField(e.target.value)}
+                      className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white"
+                    >
+                      {seekable.map((p) => (
+                        <option key={p.name} value={p.name}>
+                          {p.name} ({p.indexes!.join('/')})
+                        </option>
+                      ))}
+                    </select>
+                    <span className="text-gray-600">
+                      only indexed properties are listed
+                    </span>
+                  </label>
+                  <label className="flex items-center gap-3 text-xs text-gray-400">
+                    <span className="w-28 shrink-0">Matching first</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={20}
+                      value={prefixLength}
+                      onChange={(e) => setPrefixLength(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                      className="w-16 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white"
+                    />
+                    <span className="text-gray-600">
+                      characters — fewer finds more and costs more
+                    </span>
+                  </label>
+                  <p className="text-xs text-gray-600">
+                    Case-sensitive, because the lookup reads the property as stored — a value
+                    beginning &ldquo;AC&rdquo; is not found by a search for &ldquo;ac&rdquo;.
+                  </p>
+                </div>
+              )}
+
+              {blocking === 'prefix' && setScoringMetrics.length > 0 && (
+                <p className="text-xs text-amber-500 border-t border-gray-800 pt-3">
+                  Semantic Cosine on {[...new Set(setScoringMetrics)].join(', ')} cannot be used with
+                  this strategy — it compares whole sets of records at once rather than one pair at a
+                  time, so those fields would go unscored. Remove it, or choose another strategy.
+                </p>
+              )}
             </div>
 
             {estimate?.projectedCandidates !== undefined &&
@@ -905,7 +981,7 @@ export default function ConfigureScreen() {
                 </span>
               )}
               <div className="flex-1" />
-              <button onClick={startCompute} disabled={creating || blockedByLabelSize} className="btn-primary px-6">
+              <button onClick={startCompute} disabled={creating || blockedByLabelSize || blockedByStrategy} className="btn-primary px-6">
                 {creating ? 'Starting…' : isRerun ? 'Re-run Compute →' : 'Start Compute →'}
               </button>
             </div>

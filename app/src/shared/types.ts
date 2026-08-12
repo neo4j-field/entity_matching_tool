@@ -22,7 +22,15 @@ export interface PropertyMeta {
   mandatory: boolean
   inferredKind: PropertyKind
   sampleValues: unknown[]
+  // Online indexes covering this property alone. Blocking strategies that ask
+  // the database which nodes look like a given node need one of these, and
+  // wrapping the property in a function loses the seek — `n.p STARTS WITH $x`
+  // plans as NodeIndexSeekByRange while `toLower(n.p) STARTS WITH $x` falls
+  // back to a full label scan.
+  indexes?: PropertyIndexKind[]
 }
+
+export type PropertyIndexKind = 'RANGE' | 'TEXT' | 'POINT' | 'FULLTEXT' | 'VECTOR'
 
 export interface LabelMeta {
   name: string
@@ -98,7 +106,7 @@ export interface FieldSurfacingConfig {
  * than about its size — a low threshold on a fuzzy metric finds pairs that share
  * no word, and only exhaustive comparison will ever offer them.
  */
-export type BlockingStrategy = 'auto' | 'exhaustive' | 'token-bucket'
+export type BlockingStrategy = 'auto' | 'exhaustive' | 'token-bucket' | 'prefix'
 
 export interface SurfacingRule {
   mode: 'any' | 'all' | 'weighted-average'
@@ -121,6 +129,13 @@ export interface Session {
   fields: FieldConfig[]
   surfacingRule: SurfacingRule
   blockingStrategy?: BlockingStrategy
+  // 'prefix' only. The property to block by, which must carry a RANGE or TEXT
+  // index — the predicate is `n.p STARTS WITH x`, and without an index that is
+  // a full label scan per node. Measured on an unindexed 647k-node property:
+  // ten minutes without finishing five thousand nodes. On an indexed one:
+  // 0.17ms per node.
+  blockingField?: string
+  blockingPrefixLength?: number
   status: SessionStatus
   reviewCursor: number
   reviewFilter: ReviewFilter
@@ -185,7 +200,7 @@ export interface ScoreDistributions {
  * reaches the queue, so it belongs in the result rather than in a constant.
  */
 export interface CandidateSummary {
-  strategy: 'exhaustive' | 'token-bucket'
+  strategy: 'exhaustive' | 'token-bucket' | 'prefix'
   nodes: number
   // Pairs that reached scoring.
   pairs: number

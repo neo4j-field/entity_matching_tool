@@ -1,4 +1,6 @@
+import { int } from 'neo4j-driver'
 import { getDriver } from './connection-service'
+import { getCachedSchema } from './schema-service'
 import { pairIdFor } from './pair-id'
 import { getMetric } from './metrics/registry'
 import { upsertPairs } from './session-service'
@@ -36,8 +38,6 @@ export async function runMetrics(
 
   // Map pairId → accumulated scores
   const pairScores: PairScoreMap = new Map()
-  // Node snapshots, fetched after scoring for the nodes that ended up in a pair.
-  const snapshotMap = new Map<string, NodeSnapshot>()
 
   // Per field, the nodes that actually carry the property. Lets surfacing tell
   // "the property is absent" apart from "both have it but they scored poorly" —
@@ -59,6 +59,30 @@ export async function runMetrics(
     // densify() fills in each field's scores for pairs it finds already present,
     // which turns that seeding into a complete comparison without touching a
     // single metric.
+    // Prefix blocking replaces candidate generation rather than adding to it.
+    //
+    // The metrics' own bucketing needs every value of every field in memory,
+    // which is the label-sized step this strategy exists to avoid, so the field
+    // loop below is skipped entirely. densify() then produces every score — it
+    // already asks each metric for anything a pair is missing, working from the
+    // snapshots of nodes that actually landed in a pair.
+    if ((session.blockingStrategy ?? 'auto') === 'prefix') {
+      const tBlock = Date.now()
+      const block = await prefixBlockPairs(neo4jSession, session, pairScores, signal)
+      console.log(
+        `[compute] candidates: prefix — ${block.pairs.toLocaleString()} pairs from ` +
+          `${block.nodes.toLocaleString()} blocking nodes in ${Date.now() - tBlock}ms`
+      )
+      return await scoreAndSurface(
+        neo4jSession,
+        session,
+        pairScores,
+        { strategy: 'prefix', nodes: block.nodes, pairs: block.pairs, complete: false },
+        undefined,
+        signal
+      )
+    }
+
     const exhaustive = await seedExhaustivePairs(neo4jSession, session, pairScores)
     if (exhaustive !== null) {
       console.log(
@@ -148,47 +172,6 @@ export async function runMetrics(
     // the two nodes both carry. Surfacing cannot tell that apart from a genuine
     // low score, which made All mode reject pairs on comparisons that were
     // never attempted. Ask the metric for the real number instead.
-    // Properties for the nodes that ended up in a candidate pair — the only ones
-    // densify and surfacing ever look at.
-    const involved = new Set<string>()
-    for (const { idA, idB } of pairScores.values()) { involved.add(idA); involved.add(idB) }
-    const tSnap = Date.now()
-    await loadSnapshots(neo4jSession, involved, snapshotMap, signal)
-    console.log(
-      `[compute] snapshots: ${snapshotMap.size} of ${involved.size} nodes in ${Date.now() - tSnap}ms`
-    )
-
-    const tDense = Date.now()
-    const densified = densify(session, pairScores, snapshotMap)
-    console.log(`[compute] densify: ${densified} scores filled in ${Date.now() - tDense}ms`)
-
-    // Surface pairs using snapshots already in memory — no extra query
-    type SurfacedEntry = { pairId: string; idA: string; idB: string; scores: MetricScore[] }
-    const surfacedEntries: SurfacedEntry[] = []
-    for (const [pairId, { idA, idB, scores, abstained }] of pairScores) {
-      if (surfaced(scores, session, idA, idB, fieldNodeIds, abstained))
-        surfacedEntries.push({ pairId, idA, idB, scores })
-    }
-    console.log(`[compute] ${surfacedEntries.length} pairs surfaced`)
-
-    const surfacedPairs: CandidatePair[] = surfacedEntries.map(({ pairId, idA, idB, scores }) => ({
-      id: pairId,
-      sessionId: session.id,
-      label: session.label,
-      nodeA: snapshotMap.get(idA) ?? { id: idA, properties: {} },
-      nodeB: snapshotMap.get(idB) ?? { id: idB, properties: {} },
-      scores,
-      verdict: 'pending',
-    }))
-
-    let t = Date.now()
-    upsertPairs(surfacedPairs)
-    console.log(`[compute] upsertPairs: ${Date.now() - t}ms`)
-
-    t = Date.now()
-    const dists = computeDistributions(pairScores)
-    console.log(`[compute] computeDistributions: ${Date.now() - t}ms`)
-
     const candidates: CandidateSummary = exhaustive
       ? { strategy: 'exhaustive', nodes: exhaustive.nodes, pairs: pairScores.size, complete: true }
       : {
@@ -204,12 +187,129 @@ export async function runMetrics(
       )
     }
 
-    return { ...dists, candidates }
+    return await scoreAndSurface(neo4jSession, session, pairScores, candidates, fieldNodeIds, signal)
   } finally {
     // Fire-and-forget — session.close() involves a network round-trip to Aura;
     // awaiting it would stall the caller after all real work is done.
     neo4jSession.close().catch(() => {})
   }
+}
+
+// Partners kept per blocking node. A block is a prefix, so on a common prefix
+// it can hold thousands of nodes that share nothing else; taking all of them
+// would reproduce the unbounded-bucket problem the strategy exists to avoid.
+const PREFIX_BLOCK_LIMIT = 50
+
+export const DEFAULT_PREFIX_LENGTH = 8
+
+// Nodes per walk query. Large enough to amortise the round trip — one lookup
+// per node cost 160ms in round trips alone — small enough that the ordered
+// scan stays a bounded index seek.
+const PREFIX_WALK_BATCH = 5000
+
+/**
+ * Candidate pairs from a prefix block, asked of the database.
+ *
+ * The predicate has to touch the raw stored property — wrapping it in a
+ * function loses the index seek, so no normalisation can happen here and
+ * matching is case-sensitive. That is a recall trade the caller is choosing.
+ *
+ * Each pair is produced once, from whichever member sorts earlier, with an
+ * element-id tiebreak so two nodes holding the identical value still pair.
+ * Without the tiebreak `n.f < m.f` drops exact duplicates entirely, which are
+ * the ones most worth finding.
+ */
+async function prefixBlockPairs(
+  neo4jSession: ReturnType<ReturnType<typeof getDriver>['session']>,
+  session: Session,
+  pairScores: PairScoreMap,
+  signal?: AbortSignal
+): Promise<{ nodes: number; pairs: number }> {
+  const field = session.blockingField
+  if (!field) throw new Error('Prefix blocking needs a field to block by.')
+
+  const indexes =
+    getCachedSchema()
+      ?.labels.find((l) => l.name === session.label)
+      ?.properties.find((p) => p.name === field)?.indexes ?? []
+  if (!indexes.some((k) => k === 'RANGE' || k === 'TEXT')) {
+    throw new Error(
+      `Prefix blocking on ${session.label}.${field} needs a RANGE or TEXT index on that ` +
+        `property, and there is none. Without one the database scans the whole label for ` +
+        `every node. Choose a property that is indexed, or a different strategy.`
+    )
+  }
+
+  // In this mode densify() produces every score, and it can only ask metrics
+  // that expose scorePair. A metric without one would contribute nothing, the
+  // field would look unjudgeable, and All mode would quietly drop it — the same
+  // silent narrowing that #23 describes, arriving through a different door.
+  // Refuse the configuration instead of returning a rule narrower than the one
+  // on screen.
+  const unscorable = session.fields.flatMap((f) =>
+    f.metrics.filter((m) => !getMetric(m.metricId).scorePair).map((m) => `${f.propertyName} · ${m.metricId}`)
+  )
+  if (unscorable.length > 0) {
+    throw new Error(
+      `Prefix blocking cannot score ${unscorable.join(', ')}. That metric compares whole sets of ` +
+        `nodes at once rather than one pair at a time, so this strategy would leave those fields ` +
+        `unscored and drop them from the rule. Remove the metric, or choose another strategy.`
+    )
+  }
+
+  const prefix = Math.max(1, session.blockingPrefixLength ?? DEFAULT_PREFIX_LENGTH)
+  const label = session.label
+
+  // Walked in batches, not as one query.
+  //
+  // `WITH n ORDER BY n.f` over a whole label is a blocking sort: the database
+  // materialises every row before emitting any. On a 6.3M-node label that hit
+  // Aura's 1.3 GiB transaction limit in 24 seconds. With a LIMIT the planner
+  // seeks the index instead and streams, so the walk is a sequence of bounded
+  // queries carrying a cursor.
+  //
+  // The cursor is (value, elementId) rather than value alone, because a batch
+  // boundary can fall inside a run of equal values and `n.f > $cursor` would
+  // skip every node sharing the boundary value.
+  const q =
+    `MATCH (n:\`${label}\`) WHERE n.\`${field}\` IS NOT NULL\n` +
+    `  AND ($cv IS NULL OR n.\`${field}\` > $cv\n` +
+    `       OR (n.\`${field}\` = $cv AND elementId(n) > $cid))\n` +
+    `WITH n ORDER BY n.\`${field}\`, elementId(n) LIMIT $batch\n` +
+    `WITH n, left(n.\`${field}\`, ${prefix}) AS block\n` +
+    // OPTIONAL, so a node with no partners still returns a row. A plain MATCH
+    // drops them, and a batch where nothing matched would return nothing at all
+    // — leaving the cursor unable to advance and ending the walk early.
+    `OPTIONAL MATCH (m:\`${label}\`) WHERE m.\`${field}\` STARTS WITH block\n` +
+    `  AND (n.\`${field}\` < m.\`${field}\`\n` +
+    `       OR (n.\`${field}\` = m.\`${field}\` AND elementId(n) < elementId(m)))\n` +
+    `WITH n, [x IN collect(elementId(m)) WHERE x IS NOT NULL][..${PREFIX_BLOCK_LIMIT}] AS partners\n` +
+    `RETURN elementId(n) AS id, n.\`${field}\` AS v, partners`
+
+  let cv: unknown = null
+  let cid: string | null = null
+  let nodes = 0
+  for (;;) {
+    if (signal?.aborted) break
+    const result = await neo4jSession.run(q, { cv, cid, batch: int(PREFIX_WALK_BATCH) })
+    if (result.records.length === 0) break
+
+    for (const r of result.records) {
+      const idA = r.get('id') as string
+      nodes++
+      for (const idB of r.get('partners') as string[]) {
+        const pairId = pairIdFor(session.id, idA, idB)
+        if (!pairScores.has(pairId)) pairScores.set(pairId, { idA, idB, scores: [] })
+      }
+    }
+    if (pairScores.size > MAX_CANDIDATE_PAIRS) throw new CandidateLimitError()
+
+    const last = result.records[result.records.length - 1]
+    cv = last.get('v')
+    cid = last.get('id') as string
+    if (result.records.length < PREFIX_WALK_BATCH) break
+  }
+  return { nodes, pairs: pairScores.size }
 }
 
 // Comparing every pair costs ~325 bytes each while a run is in progress, so
@@ -268,6 +368,76 @@ async function seedExhaustivePairs(
     }
   }
   return { nodes: ids.length, pairs: pairScores.size }
+}
+
+/**
+ * Everything after candidates are chosen: fetch the properties of the nodes that
+ * landed in a pair, fill in every score, apply the surfacing rule, persist.
+ *
+ * Shared so a strategy only has to decide which pairs are worth scoring. Prefix
+ * blocking passes no fieldNodeIds because it never fetches per field — the sets
+ * are derived from the snapshots instead, which report exactly the properties
+ * each node carries.
+ */
+async function scoreAndSurface(
+  neo4jSession: ReturnType<ReturnType<typeof getDriver>['session']>,
+  session: Session,
+  pairScores: PairScoreMap,
+  candidates: CandidateSummary,
+  fieldNodeIds?: Map<string, Set<string>>,
+  signal?: AbortSignal
+): Promise<ScoreDistributions> {
+  const snapshotMap = new Map<string, NodeSnapshot>()
+  const involved = new Set<string>()
+  for (const { idA, idB } of pairScores.values()) { involved.add(idA); involved.add(idB) }
+  const tSnap = Date.now()
+  await loadSnapshots(neo4jSession, involved, snapshotMap, signal ?? new AbortController().signal)
+  console.log(
+    `[compute] snapshots: ${snapshotMap.size} of ${involved.size} nodes in ${Date.now() - tSnap}ms`
+  )
+
+  const fields =
+    fieldNodeIds ??
+    (() => {
+      const m = new Map<string, Set<string>>()
+      for (const fc of session.fields) {
+        const ids = new Set<string>()
+        for (const [id, snap] of snapshotMap) {
+          if (snap.properties[fc.propertyName] !== undefined) ids.add(id)
+        }
+        m.set(fc.propertyName, ids)
+      }
+      return m
+    })()
+
+  const tDense = Date.now()
+  const densified = densify(session, pairScores, snapshotMap)
+  console.log(`[compute] densify: ${densified} scores filled in ${Date.now() - tDense}ms`)
+
+  const surfacedPairs: CandidatePair[] = []
+  for (const [pairId, { idA, idB, scores, abstained }] of pairScores) {
+    if (!surfaced(scores, session, idA, idB, fields, abstained)) continue
+    surfacedPairs.push({
+      id: pairId,
+      sessionId: session.id,
+      label: session.label,
+      nodeA: snapshotMap.get(idA) ?? { id: idA, properties: {} },
+      nodeB: snapshotMap.get(idB) ?? { id: idB, properties: {} },
+      scores,
+      verdict: 'pending',
+    })
+  }
+  console.log(`[compute] ${surfacedPairs.length} pairs surfaced`)
+
+  let t = Date.now()
+  upsertPairs(surfacedPairs)
+  console.log(`[compute] upsertPairs: ${Date.now() - t}ms`)
+
+  t = Date.now()
+  const dists = computeDistributions(pairScores)
+  console.log(`[compute] computeDistributions: ${Date.now() - t}ms`)
+
+  return { ...dists, candidates }
 }
 
 // Loads full property maps for a set of node ids, in batches.
