@@ -46,13 +46,14 @@ function scoreColor(score: number, threshold: number): string {
 
 interface MergeModalProps {
   sessionId: string
+  partialCapture: boolean
   onClose: () => void
   onApplied: () => void
   onGoToSessions: () => void
   addToast: (msg: string, type?: 'info' | 'success' | 'error') => void
 }
 
-function MergeModal({ sessionId, onClose, onApplied, onGoToSessions, addToast }: MergeModalProps) {
+function MergeModal({ sessionId, partialCapture, onClose, onApplied, onGoToSessions, addToast }: MergeModalProps) {
   const [groups, setGroups] = useState<MergeGroup[] | null>(null)
   const [strategy, setStrategy] = useState<'discard' | 'overwrite' | 'combine'>('discard')
   const [applying, setApplying] = useState(false)
@@ -99,6 +100,20 @@ function MergeModal({ sessionId, onClose, onApplied, onGoToSessions, addToast }:
               <p className="text-sm text-gray-400">
                 {groups.length} merge group{groups.length > 1 ? 's' : ''} from marked duplicates.
               </p>
+
+              {/* Said before the irreversible step, not only in the record after
+                  it. Each of these merges is correct; what is not true is that
+                  the label has been deduplicated. */}
+              {partialCapture && (
+                <div className="bg-amber-950/40 border border-amber-900/60 rounded-xl px-4 py-3">
+                  <p className="text-sm text-amber-300">These merges rest on a partial capture</p>
+                  <p className="text-xs text-amber-200/70 mt-1">
+                    Part of the label has not been compared yet, so duplicates may remain among the
+                    nodes this pass never reached. The merges below are still correct — capture more
+                    before treating the label as deduplicated.
+                  </p>
+                </div>
+              )}
 
               {groups.map((g, i) => (
                 <div key={i} className="bg-gray-950 rounded-xl border border-gray-800 p-4 space-y-2">
@@ -998,6 +1013,7 @@ export default function ReviewScreen() {
       {showMerge && (
         <MergeModal
           sessionId={session.id}
+          partialCapture={Boolean(session.capture && !session.capture.complete)}
           onClose={() => setShowMerge(false)}
           onApplied={handleMergeApplied}
           onGoToSessions={() => { setShowMerge(false); setScreen('sessions') }}

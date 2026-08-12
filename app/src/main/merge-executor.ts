@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto'
 import { getDriver } from './connection-service'
 import { getDb } from './db'
-import { listPairs } from './session-service'
+import { listPairs, loadSession } from './session-service'
 import { writeAuditRecord as writeNeo4jAuditRecord } from './neo4j-storage'
 import type { MergeGroup, MergeApplyResult, AuditRecord, MetricScore } from '../shared/types'
 
@@ -233,6 +233,14 @@ async function mergeWithFallback(
   }
 }
 
+// A merge from a partial capture is individually correct, but the label has not
+// been deduplicated — only the part that was walked has. Nothing downstream
+// could tell the two apart, so the record now carries it.
+function captureOf(sessionId: string): AuditRecord['capture'] {
+  const capture = loadSession(sessionId)?.capture
+  return capture ? { complete: capture.complete, nodesWalked: capture.nodesWalked } : undefined
+}
+
 function writeAuditRecord(
   sessionId: string,
   passId: string,
@@ -275,13 +283,14 @@ function writeAuditRecord(
       },
       { human: 0, ai: 0, unknown: 0 }
     ),
+    capture: captureOf(sessionId),
   }
 
   db.prepare(`
     INSERT INTO audit_records(id, session_id, merge_pass_id, timestamp, label, survivor_id,
       survivor_props, absorbed_ids, absorbed_props, scores_json, conflict_strategy,
-      decided_by_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      decided_by_json, capture_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     record.id, record.sessionId, record.mergePassId,
     new Date(record.timestamp).getTime(),
@@ -291,7 +300,8 @@ function writeAuditRecord(
     JSON.stringify(record.absorbedProperties),
     JSON.stringify(record.scores),
     record.conflictStrategy,
-    JSON.stringify(record.decidedBy)
+    JSON.stringify(record.decidedBy),
+    record.capture ? JSON.stringify(record.capture) : null
   )
   return record
 }

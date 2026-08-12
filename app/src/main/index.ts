@@ -411,6 +411,7 @@ function registerIpc() {
       // Records written before provenance existed have no attribution; report
       // that honestly rather than implying a human reviewed them.
       decidedBy: JSON.parse((r.decided_by_json as string) || '{}'),
+      capture: r.capture_json ? JSON.parse(r.capture_json as string) : undefined,
     }))
   })
 

@@ -139,6 +139,11 @@ function migrate(db: Database.Database): void {
 
   addColumn(db, 'audit_records', 'decided_by_json', `TEXT NOT NULL DEFAULT '{}'`)
 
+  // How much of the label had been captured when the merge was applied. A merge
+  // from a partial capture is individually correct, but the record should not
+  // read as "this label was deduplicated" when only part of it was compared.
+  addColumn(db, 'audit_records', 'capture_json', 'TEXT')
+
   // The OpenAI semantic-cosine backend is gone, so nothing reads this setting.
   // It was stored in plaintext, unlike Neo4j passwords, so drop the row rather
   // than leaving a live key sitting in the database no code will ever use.

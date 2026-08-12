@@ -426,4 +426,8 @@ export interface AuditRecord {
   // How the pairs behind this merge were decided. A merge founded entirely on
   // AI verdicts is a materially different thing from one a human reviewed.
   decidedBy: { human: number; ai: number; unknown: number }
+  // Absent for exhaustive and token-bucket runs, which compare the whole label
+  // by construction. Present for a prefix capture, where it says whether the
+  // walk had finished and how far it had gone.
+  capture?: { complete: boolean; nodesWalked: number }
 }
