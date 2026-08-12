@@ -467,22 +467,29 @@ async function capturePrefix(
 
       const fields = fieldPresence(session, snapshotMap)
       const surfacedPairs: CandidatePair[] = []
+      // Every scored candidate is stored, surfaced or not, so a threshold can
+      // later be re-applied — including lowered — against what was actually
+      // compared. Only surfaced pairs carry node snapshots: keeping them for
+      // all of them costs 116 MB per pass on Company against 12 MB.
+      let batchSurfaced = 0
       for (const [pairId, entry] of batchScores) {
         allScores.set(pairId, entry)
         const { idA, idB, scores, abstained } = entry
-        if (!surfaced(scores, session, idA, idB, fields, abstained)) continue
+        const isSurfaced = surfaced(scores, session, idA, idB, fields, abstained)
+        if (isSurfaced) batchSurfaced++
         surfacedPairs.push({
           id: pairId,
           sessionId: session.id,
           label: session.label,
-          nodeA: snapshotMap.get(idA) ?? { id: idA, properties: {} },
-          nodeB: snapshotMap.get(idB) ?? { id: idB, properties: {} },
+          nodeA: isSurfaced ? snapshotMap.get(idA) ?? { id: idA, properties: {} } : { id: idA, properties: {} },
+          nodeB: isSurfaced ? snapshotMap.get(idB) ?? { id: idB, properties: {} } : { id: idB, properties: {} },
           scores,
           verdict: 'pending',
+          surfaced: isSurfaced,
         })
       }
       upsertPairs(surfacedPairs)
-      surfacedTotal += surfacedPairs.length
+      surfacedTotal += batchSurfaced
       onProgress({
         metricId: 'capture',
         fieldName: session.blockingField ?? '',
@@ -578,23 +585,33 @@ async function scoreAndSurface(
   const densified = densify(session, pairScores, snapshotMap)
   console.log(`[compute] densify: ${densified} scores filled in ${Date.now() - tDense}ms`)
 
-  const surfacedPairs: CandidatePair[] = []
+  // Every scored candidate is stored, surfaced or not. Scores do not depend on
+  // thresholds, so keeping the ones that fell short is what lets a threshold be
+  // changed — including lowered — and re-applied against real candidates rather
+  // than guessed at and rescanned. Only surfaced pairs carry node snapshots:
+  // storing them for all would cost 116 MB per pass on Company against 12 MB.
+  const allPairs: CandidatePair[] = []
+  let surfacedCount = 0
   for (const [pairId, { idA, idB, scores, abstained }] of pairScores) {
-    if (!surfaced(scores, session, idA, idB, fields, abstained)) continue
-    surfacedPairs.push({
+    const isSurfaced = surfaced(scores, session, idA, idB, fields, abstained)
+    if (isSurfaced) surfacedCount++
+    allPairs.push({
       id: pairId,
       sessionId: session.id,
       label: session.label,
-      nodeA: snapshotMap.get(idA) ?? { id: idA, properties: {} },
-      nodeB: snapshotMap.get(idB) ?? { id: idB, properties: {} },
+      nodeA: isSurfaced ? snapshotMap.get(idA) ?? { id: idA, properties: {} } : { id: idA, properties: {} },
+      nodeB: isSurfaced ? snapshotMap.get(idB) ?? { id: idB, properties: {} } : { id: idB, properties: {} },
       scores,
       verdict: 'pending',
+      surfaced: isSurfaced,
     })
   }
-  console.log(`[compute] ${surfacedPairs.length} pairs surfaced`)
+  console.log(
+    `[compute] ${surfacedCount} pairs surfaced, ${allPairs.length - surfacedCount} kept for re-filtering`
+  )
 
   let t = Date.now()
-  upsertPairs(surfacedPairs)
+  upsertPairs(allPairs)
   console.log(`[compute] upsertPairs: ${Date.now() - t}ms`)
 
   t = Date.now()
@@ -605,7 +622,7 @@ async function scoreAndSurface(
 }
 
 // Loads full property maps for a set of node ids, in batches.
-async function loadSnapshots(
+export async function loadSnapshots(
   neo4jSession: ReturnType<ReturnType<typeof getDriver>['session']>,
   ids: Set<string>,
   into: Map<string, NodeSnapshot>,
@@ -636,6 +653,28 @@ function surfaced(
   fieldNodeIds: Map<string, Set<string>>,
   abstained?: Set<string>
 ): boolean {
+  return applySurfacingRule(scores, session, (propertyName) => {
+    if (abstained?.has(propertyName)) return false
+    const ids = fieldNodeIds.get(propertyName)
+    return ids !== undefined && ids.has(idA) && ids.has(idB)
+  })
+}
+
+/**
+ * The surfacing rule itself, separated from how comparability is established.
+ *
+ * A compute run knows which nodes carry which property and which metrics
+ * declined; a re-filter reading pairs back from SQLite knows neither, but does
+ * not need to. After densify() a field has a score row exactly when both nodes
+ * carried it and some metric was willing to score it — the same condition — so
+ * both callers can answer `comparable` from what they have and get the same
+ * verdict out.
+ */
+export function applySurfacingRule(
+  scores: MetricScore[],
+  session: Session,
+  comparable: (propertyName: string) => boolean
+): boolean {
   const { mode, fields } = session.surfacingRule
 
   // Field score = max across metrics for that field
@@ -643,17 +682,6 @@ function surfaced(
   for (const score of scores) {
     const current = fieldScores.get(score.fieldName) ?? 0
     fieldScores.set(score.fieldName, Math.max(current, score.score))
-  }
-
-  // A field can only be judged when both nodes carry the property. Absent is
-  // not the same as scoring zero: a pair should not fail a comparison that was
-  // never possible. Both nodes must carry the property, and some metric must have been willing
-  // to score it. A field every metric declined is no more judgeable than one the
-  // nodes do not have.
-  const comparable = (propertyName: string): boolean => {
-    if (abstained?.has(propertyName)) return false
-    const ids = fieldNodeIds.get(propertyName)
-    return ids !== undefined && ids.has(idA) && ids.has(idB)
   }
 
   if (mode === 'any') {
@@ -684,10 +712,16 @@ function surfaced(
   // removed or a slider is dragged, and an unnormalized sum silently rescales
   // the combined threshold: five fields left holding 1/9 each cap the total at
   // 0.56, so a 0.85 threshold can never be met however well the pair matches.
-  // A field every metric declined is dropped from both sides of the ratio, so
-  // it neither helps nor hurts. Leaving it only in the denominator would penalise
-  // a pair for a comparison nothing was willing to make.
-  const usable = fields.filter((fc) => !abstained?.has(fc.propertyName))
+  // A field that cannot be judged is dropped from both sides of the ratio, so it
+  // neither helps nor hurts. Leaving it only in the denominator would penalise a
+  // pair for a comparison nothing was willing to make.
+  //
+  // This now covers a field one of the nodes does not carry, which previously
+  // averaged in as a zero and so counted absent data as a mismatch. 'all' mode
+  // already skipped those for exactly the reason stated above, and the two modes
+  // disagreeing on what "cannot be judged" means is what made a re-filter unable
+  // to reproduce compute's own verdict.
+  const usable = fields.filter((fc) => comparable(fc.propertyName))
   const totalWeight = usable.reduce((sum, fc) => sum + fc.weight, 0)
   if (totalWeight <= 0) return false
   const weighted = usable.reduce((sum, fc) => {

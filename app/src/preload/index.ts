@@ -20,6 +20,7 @@ import type {
   UsageSummary,
   UsageTotals,
   PairEstimate,
+  RefilterResult,
 } from '../shared/types'
 
 // Push-event listener helpers
@@ -76,6 +77,8 @@ const api = {
       ipcRenderer.invoke(IPC.PAIRS_SET_VERDICT, pairId, verdict) as Promise<void>,
     setNote: (pairId: string, note: string) =>
       ipcRenderer.invoke(IPC.PAIRS_SET_NOTE, pairId, note) as Promise<void>,
+    refilter: (sessionId: string) =>
+      ipcRenderer.invoke(IPC.PAIRS_REFILTER, sessionId) as Promise<RefilterResult>,
     export: (sessionId: string, format: 'csv' | 'json', verdictFilter: string) =>
       ipcRenderer.invoke(IPC.PAIRS_EXPORT, sessionId, format, verdictFilter) as Promise<string>,
     autoClassify: (sessionId: string) =>

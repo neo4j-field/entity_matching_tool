@@ -144,6 +144,15 @@ function migrate(db: Database.Database): void {
   // read as "this label was deduplicated" when only part of it was compared.
   addColumn(db, 'audit_records', 'capture_json', 'TEXT')
 
+  // Candidates that were scored but did not pass the surfacing rule are kept
+  // with surfaced = 0, so a threshold change re-filters what is already stored
+  // instead of forcing a rescan — and a threshold can be *lowered* to see what
+  // appears. Their node snapshots are not stored: on Company those average 580
+  // bytes each, which is 116 MB per 100k-candidate pass against 12 MB for ids
+  // and scores alone. A pair that later surfaces is hydrated from the graph.
+  addColumn(db, 'pairs', 'surfaced', 'INTEGER NOT NULL DEFAULT 1')
+  db.exec('CREATE INDEX IF NOT EXISTS idx_pairs_surfaced ON pairs(session_id, surfaced)')
+
   // The OpenAI semantic-cosine backend is gone, so nothing reads this setting.
   // It was stored in plaintext, unlike Neo4j passwords, so drop the row rather
   // than leaving a live key sitting in the database no code will ever use.

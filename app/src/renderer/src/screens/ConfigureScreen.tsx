@@ -108,6 +108,7 @@ export default function ConfigureScreen() {
 
   // Pre-populate from an existing session when coming from the review screen for a re-run
   const isRerun = Boolean(session && (session.status === 'reviewing' || session.status === 'merges-applied'))
+  const [reapplying, setReapplying] = useState(false)
 
   useEffect(() => {
     if (!isRerun || !schema) return
@@ -350,6 +351,38 @@ export default function ConfigureScreen() {
       addToast(`AI suggestion failed: ${(err as Error).message}`, 'error')
     } finally {
       setAiSuggesting(false)
+    }
+  }
+
+  // Thresholds and the surfacing rule are questions about scores already stored,
+  // not a reason to walk the label again. Re-applying them is a SQLite pass:
+  // instant, and the only way a threshold can be *lowered* to see what appears
+  // without discarding the capture and starting over.
+  async function reapplyThresholds(): Promise<void> {
+    if (!session) return
+    setReapplying(true)
+    try {
+      const partial = buildSessionPartial()
+      const updated = {
+        ...session,
+        fields: partial.fields,
+        surfacingRule: partial.surfacingRule,
+        updatedAt: new Date().toISOString(),
+      }
+      await window.api.session.save(updated)
+      const result = await window.api.pairs.refilter(session.id)
+      setSession(updated)
+      setPairs(await window.api.pairs.list(session.id))
+      const kept = result.keptForVerdict > 0 ? `, ${result.keptForVerdict} kept for their verdict` : ''
+      addToast(
+        `${result.surfaced.toLocaleString()} pairs in the queue — ${result.added} added, ${result.removed} removed${kept}`,
+        'success'
+      )
+      setScreen('review')
+    } catch (err) {
+      addToast(`Could not re-apply: ${(err as Error).message}`, 'error')
+    } finally {
+      setReapplying(false)
     }
   }
 
@@ -981,7 +1014,17 @@ export default function ConfigureScreen() {
                 </span>
               )}
               <div className="flex-1" />
-              <button onClick={startCompute} disabled={creating || blockedByLabelSize || blockedByStrategy} className="btn-primary px-6">
+              {isRerun && (
+                <button
+                  onClick={reapplyThresholds}
+                  disabled={creating || reapplying}
+                  className="btn-secondary px-4"
+                  title="Re-apply thresholds and the surfacing rule to candidates already captured, without walking the label again"
+                >
+                  {reapplying ? 'Applying…' : 'Re-apply Thresholds'}
+                </button>
+              )}
+              <button onClick={startCompute} disabled={creating || reapplying || blockedByLabelSize || blockedByStrategy} className="btn-primary px-6">
                 {creating ? 'Starting…' : isRerun ? 'Re-run Compute →' : 'Start Compute →'}
               </button>
             </div>

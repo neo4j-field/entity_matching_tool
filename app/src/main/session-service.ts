@@ -118,9 +118,16 @@ function rowToPair(row: Record<string, unknown>, scores: MetricScore[]): Candida
 
 export function listPairs(sessionId: string): CandidatePair[] {
   const db = getDb()
-  const pairs = db.prepare('SELECT * FROM pairs WHERE session_id = ?').all(sessionId) as Record<string, unknown>[]
+  // The queue is the surfaced pairs. Scored-but-unsurfaced candidates are kept
+  // for re-filtering, and would otherwise arrive here as a queue of thousands
+  // of pairs nobody asked to review.
+  const pairs = db
+    .prepare('SELECT * FROM pairs WHERE session_id = ? AND surfaced = 1')
+    .all(sessionId) as Record<string, unknown>[]
   const scoreRows = db
-    .prepare('SELECT ps.* FROM pair_scores ps JOIN pairs p ON p.id = ps.pair_id WHERE p.session_id = ?')
+    .prepare(
+      'SELECT ps.* FROM pair_scores ps JOIN pairs p ON p.id = ps.pair_id WHERE p.session_id = ? AND p.surfaced = 1'
+    )
     .all(sessionId) as Record<string, unknown>[]
 
   const scoresByPair = new Map<string, MetricScore[]>()
@@ -154,11 +161,12 @@ export function getPair(pairId: string): CandidatePair | null {
 export function upsertPairs(pairs: CandidatePair[]): void {
   const db = getDb()
   const insertPair = db.prepare(`
-    INSERT INTO pairs(id, session_id, node_a_json, node_b_json, verdict, decided_at, note)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO pairs(id, session_id, node_a_json, node_b_json, verdict, decided_at, note, surfaced)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       node_a_json = excluded.node_a_json,
-      node_b_json = excluded.node_b_json
+      node_b_json = excluded.node_b_json,
+      surfaced = excluded.surfaced
       -- verdict, decided_at, note intentionally NOT overwritten
   `)
   const upsertScore = db.prepare(`
@@ -183,7 +191,8 @@ export function upsertPairs(pairs: CandidatePair[]): void {
         JSON.stringify(pair.nodeA), JSON.stringify(pair.nodeB),
         pair.verdict,
         pair.decidedAt ? new Date(pair.decidedAt).getTime() : null,
-        pair.note ?? null
+        pair.note ?? null,
+        pair.surfaced === false ? 0 : 1
       )
       for (const score of pair.scores) {
         upsertScore.run(id, score.metricId, score.fieldName, score.score, score.aboveThreshold ? 1 : 0)

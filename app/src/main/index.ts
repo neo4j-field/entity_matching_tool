@@ -2,6 +2,7 @@ import { app, shell, BrowserWindow, ipcMain } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { IPC } from '../shared/ipc-channels'
+import { refilterPairs } from './refilter-service'
 import * as connection from './connection-service'
 import * as schema from './schema-service'
 import * as sessions from './session-service'
@@ -348,6 +349,14 @@ function registerIpc() {
   ipcMain.handle(IPC.PAIRS_SET_NOTE, (_, pairId: string, note: string) =>
     sessions.setNote(pairId, note)
   )
+  // Re-applies the surfacing rule to candidates already captured. No walk, no
+  // scoring — the scores are stored and do not depend on the thresholds.
+  ipcMain.handle(IPC.PAIRS_REFILTER, async (_, sessionId: string) => {
+    const session = sessions.loadSession(sessionId)
+    if (!session) throw new Error('Session not found')
+    return refilterPairs(session)
+  })
+
   ipcMain.handle(IPC.PAIRS_EXPORT, async (_, sessionId: string, format: 'csv' | 'json', verdictFilter: string) => {
     const pairs = sessions.listPairs(sessionId)
     const filtered = verdictFilter === 'all' ? pairs : pairs.filter((p) => p.verdict === verdictFilter)

@@ -204,6 +204,11 @@ export interface CandidatePair {
   decidedAt?: string
   note?: string
   decidedBy?: DecidedBy | null
+  // False for a candidate that was scored but did not pass the surfacing rule.
+  // Kept so thresholds can be re-applied — including lowered — without walking
+  // the label again. Such a pair carries scores but empty node snapshots; it is
+  // hydrated from the graph if a re-filter promotes it into the queue.
+  surfaced?: boolean
 }
 
 // ─── Score distributions ──────────────────────────────────────────────────────
@@ -257,6 +262,20 @@ export interface PairEstimate {
   // which counts only pairs that pass the surfacing rule.
   projectedCandidates?: number
 
+}
+
+/**
+ * Outcome of re-applying the surfacing rule to candidates already captured.
+ * `added` came back into the queue after a threshold was lowered; `removed`
+ * left it after one was raised.
+ */
+export interface RefilterResult {
+  surfaced: number
+  added: number
+  removed: number
+  // Pairs a raised threshold would have excluded but that carry a verdict, so
+  // they stay in the queue rather than hiding work someone already did.
+  keptForVerdict: number
 }
 
 // ─── Merge ───────────────────────────────────────────────────────────────────
