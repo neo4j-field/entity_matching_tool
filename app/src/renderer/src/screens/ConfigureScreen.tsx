@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { useStore } from '../store'
 import { METRICS, suggestMetrics, getMetricDef } from '../lib/metrics'
 import { formatUsd, summarizeTokens } from '../lib/usage'
+import { MAX_CANDIDATE_PAIRS } from '../../../shared/constants'
 import type {
   LabelMeta,
   FieldConfig,
@@ -799,6 +800,23 @@ export default function ConfigureScreen() {
                 <span className="text-white font-medium">{combinedThreshold.toFixed(2)}</span>
               </label>
             )}
+
+            {estimate?.projectedCandidates !== undefined &&
+              estimate.projectedCandidates > MAX_CANDIDATE_PAIRS && (
+                <div className="bg-amber-950 border border-amber-800 rounded-xl p-4 text-sm space-y-2">
+                  <p className="text-amber-300 font-medium">Compute will refuse this configuration</p>
+                  <p className="text-amber-700">
+                    It would build about {roundSampled(estimate.projectedCandidates)} pairs to compare,
+                    against a limit of {MAX_CANDIDATE_PAIRS.toLocaleString()}. That is every pair the
+                    metrics would score, before any threshold — a different and much larger number than
+                    the {estimate.count.toLocaleString()} that would reach the review queue.
+                  </p>
+                  <p className="text-amber-700">
+                    Raising a threshold will not help, because thresholds are applied after these pairs
+                    are built. Remove a field or a metric, or choose a smaller label.
+                  </p>
+                </div>
+              )}
 
             {labelNodes >= HEAVY_LABEL_NODES && (
               <div className="bg-amber-950 border border-amber-800 rounded-xl p-4 text-sm space-y-2">

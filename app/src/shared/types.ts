@@ -169,6 +169,10 @@ export interface PairEstimate {
   candidates: number
   sampledNodes?: number
   totalNodes?: number
+  // Every pair the metrics would score across the whole label, before any
+  // threshold. This is the quantity compute's ceiling applies to — not `count`,
+  // which counts only pairs that pass the surfacing rule.
+  projectedCandidates?: number
 }
 
 // ─── Merge ───────────────────────────────────────────────────────────────────

@@ -431,7 +431,22 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
     console.log(`[estimate] surfacedCount: ${count} in ${Date.now() - t}ms`)
     // Exact only when every node in the label was scored — both the fetch bound
     // and the candidate thinning have to have been no-ops.
-    if (sample.length === totalNodes) return { count, exact: true, candidates }
+    // Candidates grow roughly linearly with node count, not quadratically:
+    // tokenBucketPairs drops any bucket over maxBucketSize, so past a certain
+    // size the large buckets stop contributing and growth comes from the number
+    // of medium ones. Measured on a 647,358-node label — 20,000 nodes gave 1.31M
+    // candidates and the whole label 46.7M, against 32.4x the nodes. Scaling the
+    // sample's count by the node ratio lands within 4%.
+    //
+    // Surfaced pairs scale quadratically over the same sample, because a pair is
+    // only observed when both of its nodes are drawn. Two quantities, two laws.
+    // Conflating them is what let a configuration pass the estimate and then be
+    // refused by compute after a 101-second fetch.
+    const projectedCandidates = Math.round(candidates * (totalNodes / fetched.length))
+
+    if (sample.length === totalNodes) {
+      return { count, exact: true, candidates, projectedCandidates: candidates }
+    }
 
     const scale = pairCount(totalNodes) / pairCount(sample.length)
     return {
@@ -440,6 +455,7 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
       candidates,
       sampledNodes: sample.length,
       totalNodes,
+      projectedCandidates,
     }
   } finally {
     neo4jSession.close().catch(() => {})

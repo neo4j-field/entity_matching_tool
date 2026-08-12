@@ -25,3 +25,7 @@ export const DEFAULT_CLASSIFY_CACHED_PREFIX = true
 // account's output-tokens-per-minute limit binds. Four is deliberately modest;
 // raise it if the run isn't hitting 429s.
 export const DEFAULT_CLASSIFY_CONCURRENCY = 4
+
+// Compute refuses a configuration that would build more candidate pairs than
+// this. Shared so the Configure screen can warn before a run rather than after.
+export const MAX_CANDIDATE_PAIRS = 5_000_000

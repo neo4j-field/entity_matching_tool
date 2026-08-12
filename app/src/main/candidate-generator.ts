@@ -1,3 +1,6 @@
+import { MAX_CANDIDATE_PAIRS } from '../shared/constants'
+export { MAX_CANDIDATE_PAIRS }
+
 // Ceiling on candidate pairs from a single metric on a single field.
 //
 // This has to be enforced here rather than by the caller. Candidate generation
@@ -5,14 +8,14 @@
 // matter dies inside this function — on a 647k-node label a token metric hit
 // V8's own ~16.7M-entry Set limit and threw "Set maximum size exceeded", which
 // tells the user nothing about what they configured.
-export const MAX_CANDIDATE_PAIRS = 5_000_000
-
 export class CandidateLimitError extends Error {
   constructor() {
     super(
       `This configuration produces more than ${MAX_CANDIDATE_PAIRS.toLocaleString()} candidate pairs. ` +
-        `Raise a threshold, remove a field, or drop a metric — Estimate Pair Count on the ` +
-        `Configure screen predicts the count before a run.`
+        `to compare. That is every pair the metrics would score, before any threshold is ` +
+        `applied, so it is far larger than the number that would reach the review queue. ` +
+        `Remove a field or a metric, or narrow the label — raising a threshold does not help, ` +
+        `because thresholds are applied after these pairs are built.`
     )
     this.name = 'CandidateLimitError'
   }
