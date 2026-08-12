@@ -1,3 +1,4 @@
+import { int } from 'neo4j-driver'
 import { getDriver } from './connection-service'
 import { getCachedSchema } from './schema-service'
 import { pairIdFor } from './pair-id'
@@ -67,7 +68,7 @@ export async function runMetrics(
     // snapshots of nodes that actually landed in a pair.
     if ((session.blockingStrategy ?? 'auto') === 'prefix') {
       const tBlock = Date.now()
-      const block = await prefixBlockPairs(neo4jSession, session, pairScores)
+      const block = await prefixBlockPairs(neo4jSession, session, pairScores, signal)
       console.log(
         `[compute] candidates: prefix — ${block.pairs.toLocaleString()} pairs from ` +
           `${block.nodes.toLocaleString()} blocking nodes in ${Date.now() - tBlock}ms`
@@ -201,6 +202,11 @@ const PREFIX_BLOCK_LIMIT = 50
 
 export const DEFAULT_PREFIX_LENGTH = 8
 
+// Nodes per walk query. Large enough to amortise the round trip — one lookup
+// per node cost 160ms in round trips alone — small enough that the ordered
+// scan stays a bounded index seek.
+const PREFIX_WALK_BATCH = 5000
+
 /**
  * Candidate pairs from a prefix block, asked of the database.
  *
@@ -216,7 +222,8 @@ export const DEFAULT_PREFIX_LENGTH = 8
 async function prefixBlockPairs(
   neo4jSession: ReturnType<ReturnType<typeof getDriver>['session']>,
   session: Session,
-  pairScores: PairScoreMap
+  pairScores: PairScoreMap,
+  signal?: AbortSignal
 ): Promise<{ nodes: number; pairs: number }> {
   const field = session.blockingField
   if (!field) throw new Error('Prefix blocking needs a field to block by.')
@@ -251,34 +258,56 @@ async function prefixBlockPairs(
   }
 
   const prefix = Math.max(1, session.blockingPrefixLength ?? DEFAULT_PREFIX_LENGTH)
-  const q =
-    `MATCH (n:\`${session.label}\`) WHERE n.\`${field}\` IS NOT NULL
-` +
-    `WITH n ORDER BY n.\`${field}\`
-` +
-    `WITH n, left(n.\`${field}\`, ${prefix}) AS block
-` +
-    `MATCH (m:\`${session.label}\`) WHERE m.\`${field}\` STARTS WITH block
-` +
-    `  AND (n.\`${field}\` < m.\`${field}\`
-` +
-    `       OR (n.\`${field}\` = m.\`${field}\` AND elementId(n) < elementId(m)))
-` +
-    `WITH n, collect(elementId(m))[..${PREFIX_BLOCK_LIMIT}] AS partners
-` +
-    `WHERE size(partners) > 0
-` +
-    `RETURN elementId(n) AS id, partners`
+  const label = session.label
 
+  // Walked in batches, not as one query.
+  //
+  // `WITH n ORDER BY n.f` over a whole label is a blocking sort: the database
+  // materialises every row before emitting any. On a 6.3M-node label that hit
+  // Aura's 1.3 GiB transaction limit in 24 seconds. With a LIMIT the planner
+  // seeks the index instead and streams, so the walk is a sequence of bounded
+  // queries carrying a cursor.
+  //
+  // The cursor is (value, elementId) rather than value alone, because a batch
+  // boundary can fall inside a run of equal values and `n.f > $cursor` would
+  // skip every node sharing the boundary value.
+  const q =
+    `MATCH (n:\`${label}\`) WHERE n.\`${field}\` IS NOT NULL\n` +
+    `  AND ($cv IS NULL OR n.\`${field}\` > $cv\n` +
+    `       OR (n.\`${field}\` = $cv AND elementId(n) > $cid))\n` +
+    `WITH n ORDER BY n.\`${field}\`, elementId(n) LIMIT $batch\n` +
+    `WITH n, left(n.\`${field}\`, ${prefix}) AS block\n` +
+    // OPTIONAL, so a node with no partners still returns a row. A plain MATCH
+    // drops them, and a batch where nothing matched would return nothing at all
+    // — leaving the cursor unable to advance and ending the walk early.
+    `OPTIONAL MATCH (m:\`${label}\`) WHERE m.\`${field}\` STARTS WITH block\n` +
+    `  AND (n.\`${field}\` < m.\`${field}\`\n` +
+    `       OR (n.\`${field}\` = m.\`${field}\` AND elementId(n) < elementId(m)))\n` +
+    `WITH n, [x IN collect(elementId(m)) WHERE x IS NOT NULL][..${PREFIX_BLOCK_LIMIT}] AS partners\n` +
+    `RETURN elementId(n) AS id, n.\`${field}\` AS v, partners`
+
+  let cv: unknown = null
+  let cid: string | null = null
   let nodes = 0
-  for await (const r of neo4jSession.run(q)) {
-    const idA = r.get('id') as string
-    nodes++
-    for (const idB of r.get('partners') as string[]) {
-      const pairId = pairIdFor(session.id, idA, idB)
-      if (!pairScores.has(pairId)) pairScores.set(pairId, { idA, idB, scores: [] })
+  for (;;) {
+    if (signal?.aborted) break
+    const result = await neo4jSession.run(q, { cv, cid, batch: int(PREFIX_WALK_BATCH) })
+    if (result.records.length === 0) break
+
+    for (const r of result.records) {
+      const idA = r.get('id') as string
+      nodes++
+      for (const idB of r.get('partners') as string[]) {
+        const pairId = pairIdFor(session.id, idA, idB)
+        if (!pairScores.has(pairId)) pairScores.set(pairId, { idA, idB, scores: [] })
+      }
     }
     if (pairScores.size > MAX_CANDIDATE_PAIRS) throw new CandidateLimitError()
+
+    const last = result.records[result.records.length - 1]
+    cv = last.get('v')
+    cid = last.get('id') as string
+    if (result.records.length < PREFIX_WALK_BATCH) break
   }
   return { nodes, pairs: pairScores.size }
 }

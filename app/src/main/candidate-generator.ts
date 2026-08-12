@@ -11,7 +11,7 @@ export { MAX_CANDIDATE_PAIRS }
 export class CandidateLimitError extends Error {
   constructor() {
     super(
-      `This configuration produces more than ${MAX_CANDIDATE_PAIRS.toLocaleString()} candidate pairs. ` +
+      `This configuration produces more than ${MAX_CANDIDATE_PAIRS.toLocaleString()} candidate pairs ` +
         `to compare. That is every pair the metrics would score, before any threshold is ` +
         `applied, so it is far larger than the number that would reach the review queue. ` +
         `Remove a field or a metric, or narrow the label — raising a threshold does not help, ` +
