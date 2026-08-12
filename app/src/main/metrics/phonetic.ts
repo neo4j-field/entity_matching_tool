@@ -1,3 +1,4 @@
+import { bestOf, stringValues } from './values'
 import type { MetricModule, PairScore } from './types'
 import { MAX_CANDIDATE_PAIRS, CandidateLimitError } from '../candidate-generator'
 
@@ -67,24 +68,22 @@ export const phoneticMetric: MetricModule = {
   defaultParams: {},
 
   scorePair(a, b) {
-    if (typeof a !== 'string' || typeof b !== 'string') return null
-    return metaphone(a) === metaphone(b) ? 1 : 0
+    return bestOf(stringValues(a), stringValues(b), (x, y) =>
+      metaphone(x) === metaphone(y) ? 1 : 0
+    )
   },
 
   async computePairScores(nodes, _params, onProgress, signal) {
-    const coded = nodes
-      .map((n) => ({
-        id: n.id,
-        code: typeof n.value === 'string' ? metaphone(n.value) : null,
-      }))
-      .filter((n): n is { id: string; code: string } => !!n.code)
-
-    // Group by phonetic code — only same-code pairs score 1.0
+    // Group by phonetic code — only same-code pairs score 1.0. A node holding
+    // several values joins a bucket for each distinct code among them.
     const buckets = new Map<string, string[]>()
-    for (const { id, code } of coded) {
-      if (!buckets.has(code)) buckets.set(code, [])
-      buckets.get(code)!.push(id)
+    for (const n of nodes) {
+      for (const code of new Set(stringValues(n.value).map(metaphone).filter(Boolean))) {
+        if (!buckets.has(code)) buckets.set(code, [])
+        buckets.get(code)!.push(n.id)
+      }
     }
+    const coded = nodes
 
     const results: PairScore[] = []
     let done = 0

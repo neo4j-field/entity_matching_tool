@@ -1,3 +1,4 @@
+import { bestOf, stringValues } from './values'
 import type { MetricModule, PairScore } from './types'
 import { tokenBucketPairs } from '../candidate-generator'
 
@@ -36,28 +37,33 @@ export const editDistance: MetricModule = {
   defaultParams: { minLen: DEFAULT_MIN_LEN },
 
   scorePair(a, b, params) {
-    if (typeof a !== 'string' || typeof b !== 'string') return null
     const minLen = minLenOf(params)
-    if (a.length < minLen || b.length < minLen) return null
-    return 1 - levenshtein(a, b) / Math.max(a.length, b.length, 1)
+    return bestOf(stringValues(a), stringValues(b), (x, y) =>
+      x.length < minLen || y.length < minLen
+        ? null
+        : 1 - levenshtein(x, y) / Math.max(x.length, y.length, 1)
+    )
   },
 
   async computePairScores(nodes, params, onProgress, signal) {
     const minLen = minLenOf(params)
-    const strings = nodes
-      .map((n) => ({ id: n.id, val: typeof n.value === 'string' ? n.value : null }))
-      .filter((n): n is { id: string; val: string } => n.val !== null && n.val.length >= minLen)
+    // Bucket on every value the node holds, score across all of them. Joining
+    // for the bucket key unions the tokens; the scoring below still sees the
+    // values separately, so a list never gets compared as one run-on string.
+    const items = nodes
+      .map((n) => ({ id: n.id, values: stringValues(n.value).filter((v) => v.length >= minLen) }))
+      .filter((n) => n.values.length > 0)
 
-    const byId = new Map(strings.map((s) => [s.id, s.val]))
-    const candidates = tokenBucketPairs(strings.map((s) => ({ id: s.id, value: s.val })))
+    const byId = new Map(items.map((s) => [s.id, s.values]))
+    const candidates = tokenBucketPairs(items.map((s) => ({ id: s.id, value: s.values.join(' ') })))
     const results: PairScore[] = []
     let done = 0
     for (const [idA, idB] of candidates) {
       if (signal?.aborted) break
-      const a = byId.get(idA)!
-      const b = byId.get(idB)!
-      const dist = levenshtein(a, b)
-      const score = 1 - dist / Math.max(a.length, b.length, 1)
+      const score = bestOf(byId.get(idA)!, byId.get(idB)!, (x, y) =>
+        1 - levenshtein(x, y) / Math.max(x.length, y.length, 1)
+      )
+      if (score === null) continue
       results.push({ idA, idB, score })
       onProgress(++done / candidates.length)
     }

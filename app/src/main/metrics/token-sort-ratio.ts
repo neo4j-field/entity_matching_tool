@@ -1,3 +1,4 @@
+import { bestOf, stringValues } from './values'
 import type { MetricModule, PairScore } from './types'
 import { tokenize, tokenBucketPairs } from '../candidate-generator'
 
@@ -29,10 +30,9 @@ export const tokenSortRatio: MetricModule = {
   defaultParams: { tokenMode: 'whitespace-lowercase' },
 
   scorePair(a, b, params) {
-    if (typeof a !== 'string' || typeof b !== 'string') return null
     const mode = (params.tokenMode as string) ?? 'whitespace-lowercase'
     const norm = (v: string): string => tokenize(v, mode).sort().join(' ')
-    return sequenceRatio(norm(a), norm(b))
+    return bestOf(stringValues(a), stringValues(b), (x, y) => sequenceRatio(norm(x), norm(y)))
   },
 
   async computePairScores(nodes, params, onProgress, signal) {
@@ -40,20 +40,19 @@ export const tokenSortRatio: MetricModule = {
     const sorted = nodes
       .map((n) => ({
         id: n.id,
-        val: typeof n.value === 'string'
-          ? tokenize(n.value, mode).sort().join(' ')
-          : null,
+        values: stringValues(n.value).map((v) => tokenize(v, mode).sort().join(' ')),
       }))
-      .filter((n): n is { id: string; val: string } => n.val !== null)
+      .filter((n) => n.values.length > 0)
 
-    const candidates = tokenBucketPairs(sorted.map((s) => ({ id: s.id, value: s.val })))
-    const byId = new Map(sorted.map((s) => [s.id, s.val]))
+    const candidates = tokenBucketPairs(sorted.map((s) => ({ id: s.id, value: s.values.join(' ') })))
+    const byId = new Map(sorted.map((s) => [s.id, s.values]))
     const results: PairScore[] = []
     let done = 0
 
     for (const [idA, idB] of candidates) {
       if (signal?.aborted) break
-      results.push({ idA, idB, score: sequenceRatio(byId.get(idA)!, byId.get(idB)!) })
+      const score = bestOf(byId.get(idA)!, byId.get(idB)!, (x, y) => sequenceRatio(x, y))
+      if (score !== null) results.push({ idA, idB, score })
       onProgress(++done / candidates.length)
     }
     return results

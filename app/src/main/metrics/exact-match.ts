@@ -1,3 +1,4 @@
+import { bestOf, stringValues } from './values'
 import type { MetricModule, PairScore } from './types'
 import { MAX_CANDIDATE_PAIRS, CandidateLimitError } from '../candidate-generator'
 
@@ -20,24 +21,23 @@ export const exactMatch: MetricModule = {
 
   scorePair(a, b, params) {
     const mode = (params.normalization as string) ?? 'nfkd-lower-strip'
-    if (typeof a !== 'string' || typeof b !== 'string') return null
-    return normalize(a, mode) === normalize(b, mode) ? 1 : 0
+    return bestOf(stringValues(a), stringValues(b), (x, y) =>
+      normalize(x, mode) === normalize(y, mode) ? 1 : 0
+    )
   },
 
   async computePairScores(nodes, params, onProgress, signal) {
     const mode = (params.normalization as string) ?? 'nfkd-lower-strip'
-    const strings = nodes.map((n) => ({
-      id: n.id,
-      norm: typeof n.value === 'string' ? normalize(n.value, mode) : null,
-    }))
-
-    // Group by normalized value — only pairs within same bucket score 1.0
+    // Group by normalized value — only pairs within the same bucket score 1.0.
+    // A node holding several values joins a bucket for each of them.
     const buckets = new Map<string, string[]>()
-    for (const { id, norm } of strings) {
-      if (norm == null) continue
-      if (!buckets.has(norm)) buckets.set(norm, [])
-      buckets.get(norm)!.push(id)
+    for (const n of nodes) {
+      for (const norm of new Set(stringValues(n.value).map((v) => normalize(v, mode)))) {
+        if (!buckets.has(norm)) buckets.set(norm, [])
+        buckets.get(norm)!.push(n.id)
+      }
     }
+    const strings = nodes
 
     const results: PairScore[] = []
     let done = 0
