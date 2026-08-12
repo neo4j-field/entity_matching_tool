@@ -11,6 +11,7 @@ import type {
   ScoreDistributions,
   ScorePercentiles,
   PairEstimate,
+  CandidateSummary,
 } from '../shared/types'
 import type { NodeRecord } from './metrics/types'
 
@@ -44,6 +45,27 @@ export async function runMetrics(
   const fieldNodeIds = new Map<string, Set<string>>()
 
   try {
+    // Candidate generation, made explicit.
+    //
+    // Metrics decide which pairs are worth scoring by bucketing, and a pair that
+    // no metric buckets together is never scored by anything. That is a recall
+    // decision, and on a label small enough to compare completely it is one
+    // nobody should be paying. Measured on a 244-node label: 28,822 of 29,646
+    // possible pairs were considered and 824 — 2.8% — were never scored at all,
+    // because they shared no token, no exact value and no phonetic code on any
+    // field.
+    //
+    // So when the label is small enough to afford it, seed every pair up front.
+    // densify() fills in each field's scores for pairs it finds already present,
+    // which turns that seeding into a complete comparison without touching a
+    // single metric.
+    const exhaustive = await seedExhaustivePairs(neo4jSession, session, pairScores)
+    if (exhaustive !== null) {
+      console.log(
+        `[compute] candidates: exhaustive — ${exhaustive.nodes} nodes, ` +
+          `${exhaustive.pairs.toLocaleString()} pairs, every pair compared`
+      )
+    }
     for (const fieldConfig of session.fields) {
       for (const metricConfig of fieldConfig.metrics) {
         // Signal that this metric has started so the UI shows it at 0% immediately
@@ -167,12 +189,85 @@ export async function runMetrics(
     const dists = computeDistributions(pairScores)
     console.log(`[compute] computeDistributions: ${Date.now() - t}ms`)
 
-    return dists
+    const candidates: CandidateSummary = exhaustive
+      ? { strategy: 'exhaustive', nodes: exhaustive.nodes, pairs: pairScores.size, complete: true }
+      : {
+          strategy: 'token-bucket',
+          nodes: Math.max(0, ...[...fieldNodeIds.values()].map((ids) => ids.size)),
+          pairs: pairScores.size,
+          complete: false,
+        }
+    if (!exhaustive) {
+      console.log(
+        `[compute] candidates: token-bucket — ${candidates.pairs.toLocaleString()} pairs from ` +
+          `${candidates.nodes.toLocaleString()} nodes; pairs sharing no token were never compared`
+      )
+    }
+
+    return { ...dists, candidates }
   } finally {
     // Fire-and-forget — session.close() involves a network round-trip to Aura;
     // awaiting it would stall the caller after all real work is done.
     neo4jSession.close().catch(() => {})
   }
+}
+
+// Comparing every pair costs ~325 bytes each while a run is in progress, so
+// exhaustive mode is only offered where that is comfortably affordable. Above
+// this the existing per-metric bucketing decides candidates, as it always has.
+const EXHAUSTIVE_PAIR_LIMIT = 500_000
+
+/**
+ * Seeds every pair of the label when it is small enough to compare completely.
+ *
+ * Returns null when the label is too large, leaving candidate generation to the
+ * metrics. Scores are not written here — densify() fills them in, which is what
+ * makes this a strategy rather than a special case.
+ */
+async function seedExhaustivePairs(
+  neo4jSession: ReturnType<ReturnType<typeof getDriver>['session']>,
+  session: Session,
+  pairScores: PairScoreMap
+): Promise<{ nodes: number; pairs: number } | null> {
+  const strategy = session.blockingStrategy ?? 'auto'
+  if (strategy === 'token-bucket') return null
+
+  const counted = await neo4jSession.run(
+    `MATCH (n:\`${session.label}\`) RETURN count(n) AS total`
+  )
+  const total = toJsNumber(counted.records[0]?.get('total') ?? 0)
+  if (total < 2) return null
+
+  // 'auto' declines above the limit and lets bucketing decide. An explicit
+  // choice is honoured up to the point where it cannot complete at all, and
+  // refused past it with the reason rather than by silently doing something
+  // else — the run would otherwise die inside candidate generation.
+  if (pairCount(total) > EXHAUSTIVE_PAIR_LIMIT) {
+    if (strategy === 'auto') return null
+    if (pairCount(total) > MAX_CANDIDATE_PAIRS) {
+      throw new Error(
+        `Comparing every pair of ${total.toLocaleString()} nodes is ` +
+          `${Math.round(pairCount(total)).toLocaleString()} comparisons, past the ` +
+          `${MAX_CANDIDATE_PAIRS.toLocaleString()} limit. Choose "pairs sharing a word" ` +
+          `instead, or narrow the label.`
+      )
+    }
+  }
+
+  const ids: string[] = []
+  for await (const r of neo4jSession.run(
+    `MATCH (n:\`${session.label}\`) RETURN elementId(n) AS id`
+  )) {
+    ids.push(r.get('id') as string)
+  }
+
+  for (let i = 0; i < ids.length; i++) {
+    for (let j = i + 1; j < ids.length; j++) {
+      const pairId = pairIdFor(session.id, ids[i], ids[j])
+      if (!pairScores.has(pairId)) pairScores.set(pairId, { idA: ids[i], idB: ids[j], scores: [] })
+    }
+  }
+  return { nodes: ids.length, pairs: pairScores.size }
 }
 
 // Loads full property maps for a set of node ids, in batches.

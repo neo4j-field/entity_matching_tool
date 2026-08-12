@@ -89,6 +89,17 @@ export interface FieldSurfacingConfig {
   weight: number
 }
 
+/**
+ * How a session decides which pairs are worth scoring.
+ *
+ * 'auto' keeps the size-based choice: compare everything when the label is
+ * small enough to afford it, otherwise fall back to token bucketing. The other
+ * two override that, because the trade is a judgement about the data rather
+ * than about its size — a low threshold on a fuzzy metric finds pairs that share
+ * no word, and only exhaustive comparison will ever offer them.
+ */
+export type BlockingStrategy = 'auto' | 'exhaustive' | 'token-bucket'
+
 export interface SurfacingRule {
   mode: 'any' | 'all' | 'weighted-average'
   fields: FieldSurfacingConfig[]
@@ -109,6 +120,7 @@ export interface Session {
   label: string
   fields: FieldConfig[]
   surfacingRule: SurfacingRule
+  blockingStrategy?: BlockingStrategy
   status: SessionStatus
   reviewCursor: number
   reviewFilter: ReviewFilter
@@ -160,6 +172,25 @@ export interface ScorePercentiles {
 export interface ScoreDistributions {
   all: ScorePercentiles[]
   pending: ScorePercentiles[]
+  candidates?: CandidateSummary
+}
+
+/**
+ * How the run decided which pairs were worth scoring.
+ *
+ * This was previously invisible. A run either compared everything or compared
+ * only pairs sharing a token — discarding any token shared by more than
+ * `maxBucketSize` values — and nothing distinguished the two or reported what
+ * the second had dropped. That is the single largest determinant of what
+ * reaches the queue, so it belongs in the result rather than in a constant.
+ */
+export interface CandidateSummary {
+  strategy: 'exhaustive' | 'token-bucket'
+  nodes: number
+  // Pairs that reached scoring.
+  pairs: number
+  // Only meaningful for 'exhaustive': every pair of the label was compared.
+  complete: boolean
 }
 
 export interface PairEstimate {
