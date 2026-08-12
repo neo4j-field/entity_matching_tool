@@ -3,7 +3,7 @@ import { getDriver } from './connection-service'
 import { getCachedSchema } from './schema-service'
 import { pairIdFor } from './pair-id'
 import { getMetric } from './metrics/registry'
-import { upsertPairs } from './session-service'
+import { upsertPairs, saveSession } from './session-service'
 import { estimatePairCount, MAX_CANDIDATE_PAIRS, CandidateLimitError } from './candidate-generator'
 import { sanitize, toJsNumber } from './neo4j-int'
 import type {
@@ -14,6 +14,7 @@ import type {
   ScorePercentiles,
   PairEstimate,
   CandidateSummary,
+  CaptureState,
 } from '../shared/types'
 import type { NodeRecord } from './metrics/types'
 
@@ -59,28 +60,16 @@ export async function runMetrics(
     // densify() fills in each field's scores for pairs it finds already present,
     // which turns that seeding into a complete comparison without touching a
     // single metric.
-    // Prefix blocking replaces candidate generation rather than adding to it.
+    // Prefix blocking replaces candidate generation rather than adding to it,
+    // and captures in bounded batches rather than walking the whole label.
     //
-    // The metrics' own bucketing needs every value of every field in memory,
-    // which is the label-sized step this strategy exists to avoid, so the field
-    // loop below is skipped entirely. densify() then produces every score — it
-    // already asks each metric for anything a pair is missing, working from the
-    // snapshots of nodes that actually landed in a pair.
+    // Scoring happens inside that loop, not after it. A surfaced-pair budget
+    // cannot be honoured otherwise — how many surfaced is only known once they
+    // are scored — and scoring per batch bounds memory to a batch rather than to
+    // everything the walk finds. Each batch is persisted as it lands, so a
+    // cancelled pass keeps what it captured.
     if ((session.blockingStrategy ?? 'auto') === 'prefix') {
-      const tBlock = Date.now()
-      const block = await prefixBlockPairs(neo4jSession, session, pairScores, signal)
-      console.log(
-        `[compute] candidates: prefix — ${block.pairs.toLocaleString()} pairs from ` +
-          `${block.nodes.toLocaleString()} blocking nodes in ${Date.now() - tBlock}ms`
-      )
-      return await scoreAndSurface(
-        neo4jSession,
-        session,
-        pairScores,
-        { strategy: 'prefix', nodes: block.nodes, pairs: block.pairs, complete: false },
-        undefined,
-        signal
-      )
+      return await capturePrefix(neo4jSession, session, onProgress, signal)
     }
 
     const exhaustive = await seedExhaustivePairs(neo4jSession, session, pairScores)
@@ -207,6 +196,19 @@ export const DEFAULT_PREFIX_LENGTH = 8
 // scan stays a bounded index seek.
 const PREFIX_WALK_BATCH = 5000
 
+// A pass stops on whichever budget is reached first.
+//
+// Two, not one: a strict threshold surfaces almost nothing, so a surfaced-only
+// budget would walk the entire label finding nothing and look hung — the exact
+// failure this project has hit twice. A candidate budget bounds the work
+// regardless of how selective the rule turns out to be.
+//
+// Sized so a pass returns in seconds. At the measured 0.26ms/node and ~2.4
+// candidates per node, 100,000 candidates is roughly 40,000 nodes and about ten
+// seconds on a label of any size.
+const CAPTURE_CANDIDATE_BUDGET = 100_000
+const CAPTURE_SURFACED_BUDGET = 2_000
+
 /**
  * Candidate pairs from a prefix block, asked of the database.
  *
@@ -224,7 +226,7 @@ async function prefixBlockPairs(
   session: Session,
   pairScores: PairScoreMap,
   signal?: AbortSignal
-): Promise<{ nodes: number; pairs: number }> {
+): Promise<{ nodes: number; pairs: number; capture: CaptureState }> {
   const field = session.blockingField
   if (!field) throw new Error('Prefix blocking needs a field to block by.')
 
@@ -286,13 +288,22 @@ async function prefixBlockPairs(
     `WITH n, [x IN collect(elementId(m)) WHERE x IS NOT NULL][..${PREFIX_BLOCK_LIMIT}] AS partners\n` +
     `RETURN elementId(n) AS id, n.\`${field}\` AS v, partners`
 
-  let cv: unknown = null
-  let cid: string | null = null
+  // Resume where the last pass stopped. Pairs are produced only from the member
+  // that sorts earlier, so a resumed walk never re-finds what it already has,
+  // and reaching the end means the label is finished.
+  const prior = session.capture
+  let cv: unknown = prior?.cursorValue ?? null
+  let cid: string | null = prior?.cursorId ?? null
   let nodes = 0
+  let complete = false
+
   for (;;) {
     if (signal?.aborted) break
     const result = await neo4jSession.run(q, { cv, cid, batch: int(PREFIX_WALK_BATCH) })
-    if (result.records.length === 0) break
+    if (result.records.length === 0) {
+      complete = true
+      break
+    }
 
     for (const r of result.records) {
       const idA = r.get('id') as string
@@ -307,9 +318,24 @@ async function prefixBlockPairs(
     const last = result.records[result.records.length - 1]
     cv = last.get('v')
     cid = last.get('id') as string
-    if (result.records.length < PREFIX_WALK_BATCH) break
+
+    // A short batch means the walk ran out of nodes, not out of budget.
+    // One batch per call — the capture loop owns the budget, because it is the
+    // only place that knows how many pairs actually surfaced.
+    if (result.records.length < PREFIX_WALK_BATCH) complete = true
+    break
   }
-  return { nodes, pairs: pairScores.size }
+
+  return {
+    nodes: (prior?.nodesWalked ?? 0) + nodes,
+    pairs: pairScores.size,
+    capture: {
+      cursorValue: complete ? null : (cv as string | null),
+      cursorId: complete ? null : cid,
+      nodesWalked: (prior?.nodesWalked ?? 0) + nodes,
+      complete,
+    },
+  }
 }
 
 // Comparing every pair costs ~325 bytes each while a run is in progress, so
@@ -368,6 +394,106 @@ async function seedExhaustivePairs(
     }
   }
   return { nodes: ids.length, pairs: pairScores.size }
+}
+
+/**
+ * Walks the label in bounded batches, scoring and persisting each before asking
+ * for the next, stopping on whichever budget is reached first.
+ */
+async function capturePrefix(
+  neo4jSession: ReturnType<ReturnType<typeof getDriver>['session']>,
+  session: Session,
+  onProgress: (evt: ProgressEvent) => void,
+  signal: AbortSignal
+): Promise<ScoreDistributions> {
+  const allScores: PairScoreMap = new Map()
+  const snapshotMap = new Map<string, NodeSnapshot>()
+  let surfacedTotal = 0
+  let capture: CaptureState =
+    session.capture ?? { cursorValue: null, cursorId: null, nodesWalked: 0, complete: false }
+
+  const started = Date.now()
+  for (;;) {
+    if (signal.aborted) break
+
+    const batchScores: PairScoreMap = new Map()
+    const walked = await prefixBlockPairs(neo4jSession, { ...session, capture }, batchScores, signal)
+    capture = walked.capture
+
+    if (batchScores.size > 0) {
+      // Only the nodes in this batch's pairs, so memory tracks the batch.
+      const involved = new Set<string>()
+      for (const { idA, idB } of batchScores.values()) { involved.add(idA); involved.add(idB) }
+      await loadSnapshots(neo4jSession, involved, snapshotMap, signal)
+      densify(session, batchScores, snapshotMap)
+
+      const fields = fieldPresence(session, snapshotMap)
+      const surfacedPairs: CandidatePair[] = []
+      for (const [pairId, entry] of batchScores) {
+        allScores.set(pairId, entry)
+        const { idA, idB, scores, abstained } = entry
+        if (!surfaced(scores, session, idA, idB, fields, abstained)) continue
+        surfacedPairs.push({
+          id: pairId,
+          sessionId: session.id,
+          label: session.label,
+          nodeA: snapshotMap.get(idA) ?? { id: idA, properties: {} },
+          nodeB: snapshotMap.get(idB) ?? { id: idB, properties: {} },
+          scores,
+          verdict: 'pending',
+        })
+      }
+      upsertPairs(surfacedPairs)
+      surfacedTotal += surfacedPairs.length
+      onProgress({
+        metricId: 'capture',
+        fieldName: session.blockingField ?? '',
+        pct: capture.complete ? 100 : 0,
+        pairsAbove: surfacedTotal,
+      })
+    }
+
+    if (capture.complete) break
+    if (allScores.size >= CAPTURE_CANDIDATE_BUDGET) break
+    if (surfacedTotal >= CAPTURE_SURFACED_BUDGET) break
+  }
+
+  // Persist how far the walk reached, so the next pass resumes rather than
+  // restarts. Written even when the pass was cancelled — the pairs it captured
+  // are already in the queue, and re-walking them would find nothing new.
+  saveSession({ ...session, capture, updatedAt: new Date().toISOString() })
+
+  console.log(
+    `[compute] capture: ${allScores.size.toLocaleString()} candidates, ${surfacedTotal} surfaced, ` +
+      `${capture.nodesWalked.toLocaleString()} nodes walked, ` +
+      `${capture.complete ? 'label complete' : 'more remaining'}, ${Date.now() - started}ms`
+  )
+
+  return {
+    ...computeDistributions(allScores),
+    candidates: {
+      strategy: 'prefix',
+      nodes: capture.nodesWalked,
+      pairs: allScores.size,
+      complete: capture.complete,
+    },
+  }
+}
+
+/** Which nodes carry each configured field, read from their snapshots. */
+function fieldPresence(
+  session: Session,
+  snapshots: Map<string, NodeSnapshot>
+): Map<string, Set<string>> {
+  const m = new Map<string, Set<string>>()
+  for (const fc of session.fields) {
+    const ids = new Set<string>()
+    for (const [id, snap] of snapshots) {
+      if (snap.properties[fc.propertyName] !== undefined) ids.add(id)
+    }
+    m.set(fc.propertyName, ids)
+  }
+  return m
 }
 
 /**

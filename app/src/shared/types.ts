@@ -108,6 +108,25 @@ export interface FieldSurfacingConfig {
  */
 export type BlockingStrategy = 'auto' | 'exhaustive' | 'token-bucket' | 'prefix'
 
+/**
+ * How far a capture has walked, and whether it finished.
+ *
+ * A pass stops on a budget rather than at the end of the label, so a session
+ * can be partway through. The cursor is (value, elementId) because a batch
+ * boundary can fall inside a run of equal values, and resuming from the value
+ * alone would skip every node sharing it.
+ *
+ * `complete` is not cosmetic: a merge from a partial capture is individually
+ * correct, but "this label has been deduplicated" stops being true, and nothing
+ * downstream can tell the difference without being told.
+ */
+export interface CaptureState {
+  cursorValue: string | null
+  cursorId: string | null
+  nodesWalked: number
+  complete: boolean
+}
+
 export interface SurfacingRule {
   mode: 'any' | 'all' | 'weighted-average'
   fields: FieldSurfacingConfig[]
@@ -136,6 +155,7 @@ export interface Session {
   // 0.17ms per node.
   blockingField?: string
   blockingPrefixLength?: number
+  capture?: CaptureState
   status: SessionStatus
   reviewCursor: number
   reviewFilter: ReviewFilter
