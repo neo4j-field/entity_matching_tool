@@ -2,6 +2,7 @@ import { app, shell, BrowserWindow, ipcMain } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { IPC } from '../shared/ipc-channels'
+import { refilterPairs } from './refilter-service'
 import * as connection from './connection-service'
 import * as schema from './schema-service'
 import * as sessions from './session-service'
@@ -348,21 +349,50 @@ function registerIpc() {
   ipcMain.handle(IPC.PAIRS_SET_NOTE, (_, pairId: string, note: string) =>
     sessions.setNote(pairId, note)
   )
+  // Re-applies the surfacing rule to candidates already captured. No walk, no
+  // scoring — the scores are stored and do not depend on the thresholds.
+  ipcMain.handle(IPC.PAIRS_REFILTER, async (_, sessionId: string) => {
+    const session = sessions.loadSession(sessionId)
+    if (!session) throw new Error('Session not found')
+    return refilterPairs(session)
+  })
+
   ipcMain.handle(IPC.PAIRS_EXPORT, async (_, sessionId: string, format: 'csv' | 'json', verdictFilter: string) => {
     const pairs = sessions.listPairs(sessionId)
     const filtered = verdictFilter === 'all' ? pairs : pairs.filter((p) => p.verdict === verdictFilter)
     if (format === 'json') return JSON.stringify(filtered, null, 2)
     // CSV
     const allMetricKeys = [...new Set(filtered.flatMap((p) => p.scores.map((s) => `${s.metricId}_${s.fieldName}`)))]
-    const header = ['pair_id', 'node_a_id', 'node_a_display', 'node_b_id', 'node_b_display', 'verdict', 'decided_at', 'note', ...allMetricKeys]
-    const displayVal = (props: Record<string, unknown>) =>
-      String(props.name ?? props.title ?? props.heading ?? props.summary ?? props.text ?? '')
+    // The values the run actually compared. Without them the export carries
+    // scores with nothing to read them against — and on a label with no `name`
+    // it carried nothing identifying at all, because the display fallback below
+    // only ever knew a handful of property names.
+    const matchedFields = sessions.loadSession(sessionId)?.fields.map((f) => f.propertyName) ?? []
+    const fieldColumns = matchedFields.flatMap((f) => [`node_a_${f}`, `node_b_${f}`])
+    const header = [
+      'pair_id', 'node_a_id', 'node_a_display', 'node_b_id', 'node_b_display',
+      'verdict', 'decided_at', 'note', ...fieldColumns, ...allMetricKeys,
+    ]
+    // Falls through to the fields the session matched on, then to any string
+    // property, so a label that names its entities something this list has never
+    // heard of still exports something a human can identify.
+    const displayVal = (props: Record<string, unknown>): string => {
+      const known = props.name ?? props.title ?? props.heading ?? props.summary ?? props.text
+      if (known != null) return String(known)
+      for (const f of matchedFields) {
+        if (props[f] != null) return String(props[f])
+      }
+      const firstString = Object.values(props).find((v) => typeof v === 'string' && v.length > 0)
+      return firstString === undefined ? '' : String(firstString)
+    }
+    const cell = (v: unknown): string => (v == null ? '' : String(v))
     const rows = filtered.map((p) => {
       const scoreMap = Object.fromEntries(p.scores.map((s) => [`${s.metricId}_${s.fieldName}`, s.score]))
       return [
         p.id, p.nodeA.id, displayVal(p.nodeA.properties),
         p.nodeB.id, displayVal(p.nodeB.properties),
         p.verdict, p.decidedAt ?? '', p.note ?? '',
+        ...matchedFields.flatMap((f) => [cell(p.nodeA.properties[f]), cell(p.nodeB.properties[f])]),
         ...allMetricKeys.map((k) => scoreMap[k] ?? ''),
       ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')
     })
@@ -411,6 +441,7 @@ function registerIpc() {
       // Records written before provenance existed have no attribution; report
       // that honestly rather than implying a human reviewed them.
       decidedBy: JSON.parse((r.decided_by_json as string) || '{}'),
+      capture: r.capture_json ? JSON.parse(r.capture_json as string) : undefined,
     }))
   })
 

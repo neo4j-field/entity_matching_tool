@@ -108,6 +108,39 @@ export interface FieldSurfacingConfig {
  */
 export type BlockingStrategy = 'auto' | 'exhaustive' | 'token-bucket' | 'prefix'
 
+/**
+ * How far a capture has walked, and whether it finished.
+ *
+ * A pass stops on a budget rather than at the end of the label, so a session
+ * can be partway through. The cursor is (value, elementId) because a batch
+ * boundary can fall inside a run of equal values, and resuming from the value
+ * alone would skip every node sharing it.
+ *
+ * `complete` is not cosmetic: a merge from a partial capture is individually
+ * correct, but "this label has been deduplicated" stops being true, and nothing
+ * downstream can tell the difference without being told.
+ */
+/*
+ * A merge between passes can delete the node the cursor names. That is safe:
+ * the resume predicate compares the stored value and elementId and never looks
+ * the cursor node up, so a vanished one still orders the walk. Nodes sharing
+ * its value may be offered a second time, which the upsert absorbs; none is
+ * ever skipped. Verified against a cursor naming an elementId that does not
+ * exist.
+ */
+export interface CaptureState {
+  cursorValue: string | null
+  cursorId: string | null
+  nodesWalked: number
+  complete: boolean
+  // What the walked pairs were scored against. Resuming is only coherent while
+  // this holds: change a field, a metric, or the blocking key and the pairs
+  // already captured answer a different question from the ones still to come.
+  // Thresholds are deliberately excluded — they re-filter scores rather than
+  // change them, so they do not invalidate a walk.
+  fingerprint?: string
+}
+
 export interface SurfacingRule {
   mode: 'any' | 'all' | 'weighted-average'
   fields: FieldSurfacingConfig[]
@@ -136,6 +169,7 @@ export interface Session {
   // 0.17ms per node.
   blockingField?: string
   blockingPrefixLength?: number
+  capture?: CaptureState
   status: SessionStatus
   reviewCursor: number
   reviewFilter: ReviewFilter
@@ -170,6 +204,11 @@ export interface CandidatePair {
   decidedAt?: string
   note?: string
   decidedBy?: DecidedBy | null
+  // False for a candidate that was scored but did not pass the surfacing rule.
+  // Kept so thresholds can be re-applied — including lowered — without walking
+  // the label again. Such a pair carries scores but empty node snapshots; it is
+  // hydrated from the graph if a re-filter promotes it into the queue.
+  surfaced?: boolean
 }
 
 // ─── Score distributions ──────────────────────────────────────────────────────
@@ -221,8 +260,35 @@ export interface PairEstimate {
   // Every pair the metrics would score across the whole label, before any
   // threshold. This is the quantity compute's ceiling applies to — not `count`,
   // which counts only pairs that pass the surfacing rule.
+  //
+  // Absent for an incremental capture, which never builds a whole-label pair
+  // set and so has nothing for that ceiling to apply to.
   projectedCandidates?: number
+  // True when the estimate describes the next capture pass rather than the whole
+  // label. `count` and `candidates` are then per-pass figures.
+  //
+  // There is deliberately no "passes to finish the label" figure. Pair density
+  // varies by region badly enough that probing Address at several points put it
+  // between 146 and 1,730 passes depending only on the sampling, so any such
+  // number would be authoritative-looking noise.
+  incremental?: boolean
+}
 
+/**
+ * Outcome of re-applying the surfacing rule to candidates already captured.
+ * `added` came back into the queue after a threshold was lowered; `removed`
+ * left it after one was raised.
+ */
+export interface RefilterResult {
+  surfaced: number
+  added: number
+  removed: number
+  // Pairs a raised threshold would have excluded but that carry a verdict, so
+  // they stay in the queue rather than hiding work someone already did.
+  keptForVerdict: number
+  // Pairs whose stored snapshots were re-fetched because they predate temporal
+  // conversion and were displaying as "[object Object]".
+  repaired: number
 }
 
 // ─── Merge ───────────────────────────────────────────────────────────────────
@@ -392,4 +458,8 @@ export interface AuditRecord {
   // How the pairs behind this merge were decided. A merge founded entirely on
   // AI verdicts is a materially different thing from one a human reviewed.
   decidedBy: { human: number; ai: number; unknown: number }
+  // Absent for exhaustive and token-bucket runs, which compare the whole label
+  // by construction. Present for a prefix capture, where it says whether the
+  // walk had finished and how far it had gone.
+  capture?: { complete: boolean; nodesWalked: number }
 }

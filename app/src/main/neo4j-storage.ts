@@ -154,7 +154,8 @@ export async function writeAuditRecord(record: AuditRecord): Promise<void> {
          id: $id, sessionId: $sessionId, mergePassId: $mergePassId,
          timestamp: $timestamp, label: $label, conflictStrategy: $conflictStrategy,
          pairsDecidedByHuman: $byHuman, pairsDecidedByAi: $byAi,
-         pairsDecidedByUnknown: $byUnknown
+         pairsDecidedByUnknown: $byUnknown,
+         labelFullyCompared: $labelFullyCompared, nodesWalked: $nodesWalked
        })
        WITH r
        MATCH (survivor) WHERE elementId(survivor) = $survivorId
@@ -170,6 +171,13 @@ export async function writeAuditRecord(record: AuditRecord): Promise<void> {
         byHuman: record.decidedBy?.human ?? 0,
         byAi: record.decidedBy?.ai ?? 0,
         byUnknown: record.decidedBy?.unknown ?? 0,
+        // Whether the merge rests on a complete comparison of the label or on
+        // part of one. Anything reading these records out of the graph has no
+        // other way to know, and the difference is not cosmetic: a partial
+        // capture leaves duplicates it never looked at. A run with no capture
+        // state compared the whole label by construction.
+        labelFullyCompared: record.capture ? record.capture.complete : true,
+        nodesWalked: record.capture?.nodesWalked ?? null,
       }
     )
     // Link absorbed nodes

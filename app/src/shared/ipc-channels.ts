@@ -31,6 +31,7 @@ export const IPC = {
   PAIRS_LIST: 'pairs:list',
   PAIRS_SET_VERDICT: 'pairs:setVerdict',
   PAIRS_SET_NOTE: 'pairs:setNote',
+  PAIRS_REFILTER: 'pairs:refilter',
   PAIRS_EXPORT: 'pairs:export',
   PAIRS_AUTO_CLASSIFY: 'pairs:autoClassify',
   PAIRS_AUTO_CLASSIFY_CANCEL: 'pairs:autoClassify:cancel',

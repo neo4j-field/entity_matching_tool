@@ -94,7 +94,10 @@ export default function ConfigureScreen() {
   const labelNodes = selectedLabel?.count ?? 0
   const projectedGb = (labelNodes * BYTES_PER_NODE) / 1_073_741_824
   const isExtremeLabel = labelNodes >= EXTREME_LABEL_NODES
-  const blockedByLabelSize = isExtremeLabel && !acceptLargeLabel
+  // The size gate guards a memory cost prefix blocking does not incur — it holds
+  // one batch, not the label — so gating it there would disable Start on exactly
+  // the labels the strategy exists for, behind a checkbox no longer shown.
+  const blockedByLabelSize = isExtremeLabel && blocking !== 'prefix' && !acceptLargeLabel
   // Compute refuses this combination, so refuse it here rather than letting the
   // run fail partway through.
   const blockedByStrategy = blocking === 'prefix' && setScoringMetrics.length > 0
@@ -108,6 +111,7 @@ export default function ConfigureScreen() {
 
   // Pre-populate from an existing session when coming from the review screen for a re-run
   const isRerun = Boolean(session && (session.status === 'reviewing' || session.status === 'merges-applied'))
+  const [reapplying, setReapplying] = useState(false)
 
   useEffect(() => {
     if (!isRerun || !schema) return
@@ -350,6 +354,39 @@ export default function ConfigureScreen() {
       addToast(`AI suggestion failed: ${(err as Error).message}`, 'error')
     } finally {
       setAiSuggesting(false)
+    }
+  }
+
+  // Thresholds and the surfacing rule are questions about scores already stored,
+  // not a reason to walk the label again. Re-applying them is a SQLite pass:
+  // instant, and the only way a threshold can be *lowered* to see what appears
+  // without discarding the capture and starting over.
+  async function reapplyThresholds(): Promise<void> {
+    if (!session) return
+    setReapplying(true)
+    try {
+      const partial = buildSessionPartial()
+      const updated = {
+        ...session,
+        fields: partial.fields,
+        surfacingRule: partial.surfacingRule,
+        updatedAt: new Date().toISOString(),
+      }
+      await window.api.session.save(updated)
+      const result = await window.api.pairs.refilter(session.id)
+      setSession(updated)
+      setPairs(await window.api.pairs.list(session.id))
+      const repaired = result.repaired > 0 ? `, ${result.repaired} refreshed from the graph` : ''
+      const kept = result.keptForVerdict > 0 ? `, ${result.keptForVerdict} kept for their verdict` : ''
+      addToast(
+        `${result.surfaced.toLocaleString()} pairs in the queue — ${result.added} added, ${result.removed} removed${kept}${repaired}`,
+        'success'
+      )
+      setScreen('review')
+    } catch (err) {
+      addToast(`Could not re-apply: ${(err as Error).message}`, 'error')
+    } finally {
+      setReapplying(false)
     }
   }
 
@@ -922,26 +959,44 @@ export default function ConfigureScreen() {
                     the {estimate.count.toLocaleString()} that would reach the review queue.
                   </p>
                   <p className="text-amber-700">
-                    Raising a threshold will not help, because thresholds are applied after these pairs
-                    are built. Remove a field or a metric, or choose a smaller label.
+                    Raising a threshold will not help, because thresholds are applied after these
+                    pairs are built. Remove a field or a metric — or switch to prefix blocking,
+                    which never builds a whole-label pair set: it walks the label in order and
+                    captures a bounded batch per pass, so this ceiling does not apply to it.
                   </p>
                 </div>
               )}
 
-            {labelNodes >= HEAVY_LABEL_NODES && (
+            {labelNodes >= HEAVY_LABEL_NODES && blocking === 'prefix' && (
+              <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 text-sm space-y-2">
+                <p className="text-white font-medium">
+                  {selectedLabel!.name} has {labelNodes.toLocaleString()} nodes
+                </p>
+                <p className="text-gray-400">
+                  Prefix blocking is built for this. It walks the label in indexed order holding one
+                  batch at a time rather than loading every node, and stops on a budget — so the
+                  first pass returns a reviewable queue in seconds however large the label is. You
+                  can capture more from the review screen, and each pass resumes where the last
+                  stopped.
+                </p>
+              </div>
+            )}
+
+            {labelNodes >= HEAVY_LABEL_NODES && blocking !== 'prefix' && (
               <div className="bg-amber-950 border border-amber-800 rounded-xl p-4 text-sm space-y-2">
                 <p className="text-amber-300 font-medium">
                   {selectedLabel!.name} has {labelNodes.toLocaleString()} nodes
                 </p>
                 <p className="text-amber-700">
-                  Compute loads every one of them into memory and holds them for the whole run —
-                  about {projectedGb.toFixed(1)} GB for this label, before pair scores are counted.
+                  This strategy loads every one of them into memory and holds them for the whole run
+                  — about {projectedGb.toFixed(1)} GB for this label, before pair scores are counted.
                   {isExtremeLabel
                     ? ' That is past what the app can hold, so this run will most likely run out of memory and close the app.'
                     : ' Expect a long run and heavy memory use.'}
                 </p>
                 <p className="text-amber-700">
-                  Estimate Pair Count is safe at any size — it samples rather than loading the label.
+                  Prefix blocking avoids this entirely — it walks the label in batches instead of
+                  loading it. Estimate Pair Count is safe at any size either way; it samples.
                 </p>
                 {isExtremeLabel && (
                   <label className="flex items-center gap-2 text-amber-300 pt-1">
@@ -961,7 +1016,22 @@ export default function ConfigureScreen() {
               <button onClick={runEstimate} disabled={estimating} className="btn-secondary text-sm">
                 {estimating ? 'Estimating…' : 'Estimate Pair Count'}
               </button>
-              {estimate !== null && (
+              {estimate !== null && estimate.incremental && (
+                <span className="text-sm text-gray-400">
+                  ≈{' '}
+                  <span className="text-white font-medium">
+                    {roundSampled(estimate.count, estimate.observed)}
+                  </span>{' '}
+                  pairs in the next capture pass
+                  <span className="text-gray-500">
+                    {' '}— from {estimate.observed?.toLocaleString()}{' '}
+                    {estimate.observed === 1 ? 'pair' : 'pairs'} in the{' '}
+                    {estimate.sampledNodes?.toLocaleString()} nodes the walk reaches next. A pass
+                    stops on its budget, so this is what one pass yields, not what the label holds.
+                  </span>
+                </span>
+              )}
+              {estimate !== null && !estimate.incremental && (
                 <span className="text-sm text-gray-400">
                   {estimate.exact ? '' : '≈ '}
                   <span className="text-white font-medium">
@@ -981,7 +1051,17 @@ export default function ConfigureScreen() {
                 </span>
               )}
               <div className="flex-1" />
-              <button onClick={startCompute} disabled={creating || blockedByLabelSize || blockedByStrategy} className="btn-primary px-6">
+              {isRerun && (
+                <button
+                  onClick={reapplyThresholds}
+                  disabled={creating || reapplying}
+                  className="btn-secondary px-4"
+                  title="Re-apply thresholds and the surfacing rule to candidates already captured, without walking the label again"
+                >
+                  {reapplying ? 'Applying…' : 'Re-apply Thresholds'}
+                </button>
+              )}
+              <button onClick={startCompute} disabled={creating || reapplying || blockedByLabelSize || blockedByStrategy} className="btn-primary px-6">
                 {creating ? 'Starting…' : isRerun ? 'Re-run Compute →' : 'Start Compute →'}
               </button>
             </div>

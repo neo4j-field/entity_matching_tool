@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto'
 import { legacyPairId } from './pair-id'
-import { getDb } from './db'
+import { getDb, reclaimUnusedSpace } from './db'
 import type { Session, CandidatePair, DecidedBy, MetricScore, Verdict } from '../shared/types'
 
 // ── Sessions ──────────────────────────────────────────────────────────────────
@@ -17,6 +17,7 @@ function rowToSession(row: Record<string, unknown>): Session {
       | 'blockingStrategy'
       | 'blockingField'
       | 'blockingPrefixLength'
+      | 'capture'
     >),
     status: row.status as Session['status'],
     reviewCursor: row.review_cursor as number,
@@ -46,13 +47,13 @@ export function createSession(partial: Omit<Session, 'id' | 'createdAt' | 'updat
   const db = getDb()
   const id = randomUUID()
   const now = Date.now()
-  const { fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength, ...rest } = partial
+  const { fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength, capture, ...rest } = partial
   db.prepare(`
     INSERT INTO sessions(id, connection_id, label, config_json, status, review_cursor, review_filter, review_sort, merge_passes, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id, rest.connectionId, rest.label,
-    JSON.stringify({ fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength }),
+    JSON.stringify({ fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength, capture }),
     rest.status,
     rest.reviewCursor,
     JSON.stringify(rest.reviewFilter),
@@ -71,7 +72,7 @@ export function loadSession(id: string): Session | null {
 
 export function saveSession(session: Session): void {
   const db = getDb()
-  const { fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength } = session
+  const { fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength, capture } = session
   db.prepare(`
     UPDATE sessions SET
       config_json   = ?,
@@ -83,7 +84,7 @@ export function saveSession(session: Session): void {
       updated_at    = ?
     WHERE id = ?
   `).run(
-    JSON.stringify({ fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength }),
+    JSON.stringify({ fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength, capture }),
     session.status,
     session.reviewCursor,
     JSON.stringify(session.reviewFilter),
@@ -96,6 +97,10 @@ export function saveSession(session: Session): void {
 
 export function deleteSession(id: string): void {
   getDb().prepare('DELETE FROM sessions WHERE id = ?').run(id)
+  // Cascades clear the session's pairs, scores and audit records, but SQLite
+  // keeps the pages. Deleting a session is the one moment a large amount of
+  // space becomes free at once, so it is where reclaiming belongs.
+  reclaimUnusedSpace()
 }
 
 // ── Pairs ─────────────────────────────────────────────────────────────────────
@@ -117,9 +122,16 @@ function rowToPair(row: Record<string, unknown>, scores: MetricScore[]): Candida
 
 export function listPairs(sessionId: string): CandidatePair[] {
   const db = getDb()
-  const pairs = db.prepare('SELECT * FROM pairs WHERE session_id = ?').all(sessionId) as Record<string, unknown>[]
+  // The queue is the surfaced pairs. Scored-but-unsurfaced candidates are kept
+  // for re-filtering, and would otherwise arrive here as a queue of thousands
+  // of pairs nobody asked to review.
+  const pairs = db
+    .prepare('SELECT * FROM pairs WHERE session_id = ? AND surfaced = 1')
+    .all(sessionId) as Record<string, unknown>[]
   const scoreRows = db
-    .prepare('SELECT ps.* FROM pair_scores ps JOIN pairs p ON p.id = ps.pair_id WHERE p.session_id = ?')
+    .prepare(
+      'SELECT ps.* FROM pair_scores ps JOIN pairs p ON p.id = ps.pair_id WHERE p.session_id = ? AND p.surfaced = 1'
+    )
     .all(sessionId) as Record<string, unknown>[]
 
   const scoresByPair = new Map<string, MetricScore[]>()
@@ -153,11 +165,12 @@ export function getPair(pairId: string): CandidatePair | null {
 export function upsertPairs(pairs: CandidatePair[]): void {
   const db = getDb()
   const insertPair = db.prepare(`
-    INSERT INTO pairs(id, session_id, node_a_json, node_b_json, verdict, decided_at, note)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO pairs(id, session_id, node_a_json, node_b_json, verdict, decided_at, note, surfaced)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       node_a_json = excluded.node_a_json,
-      node_b_json = excluded.node_b_json
+      node_b_json = excluded.node_b_json,
+      surfaced = excluded.surfaced
       -- verdict, decided_at, note intentionally NOT overwritten
   `)
   const upsertScore = db.prepare(`
@@ -182,7 +195,8 @@ export function upsertPairs(pairs: CandidatePair[]): void {
         JSON.stringify(pair.nodeA), JSON.stringify(pair.nodeB),
         pair.verdict,
         pair.decidedAt ? new Date(pair.decidedAt).getTime() : null,
-        pair.note ?? null
+        pair.note ?? null,
+        pair.surfaced === false ? 0 : 1
       )
       for (const score of pair.scores) {
         upsertScore.run(id, score.metricId, score.fieldName, score.score, score.aboveThreshold ? 1 : 0)

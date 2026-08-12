@@ -11,7 +11,7 @@ interface ProgressEntry {
 }
 
 export default function ComputeScreen() {
-  const { session, setSession, setScreen, setPairs, setDistributions, addToast } = useStore()
+  const { session, setSession, setScreen, setPairs, setDistributions, addToast, schema } = useStore()
   const [progress, setProgress] = useState<Map<string, ProgressEntry>>(new Map())
   const [done, setDone] = useState(false)
   const [dists, setDists] = useState<ScoreDistributions | null>(null)
@@ -35,6 +35,10 @@ export default function ComputeScreen() {
     const offDone = window.api.compute.onDone((d) => {
       setDists(d)
       setDone(true)
+      // Compute persists the capture cursor itself, so the copy in the store is
+      // now stale. proceed() spreads that copy over a save — without this reload
+      // it writes the pre-run cursor back and the next capture starts over.
+      if (session) window.api.session.load(session.id).then(setSession)
       if (session) {
         const init: Record<string, number> = {}
         for (const f of session.fields) {
@@ -85,6 +89,20 @@ export default function ComputeScreen() {
     setPairs(pairs)
     setScreen('review')
   }
+
+  const capture = session?.capture
+  const labelCount = schema?.labels.find((l) => l.name === session?.label)?.count ?? 0
+  // A node is compared against every partner sharing its prefix, so walking it
+  // covers pairs on both sides. After k of N nodes the reachable share of pairs
+  // is 1 - (1 - k/N)^2 — well ahead of k/N, which is why a partial capture is
+  // worth reviewing rather than a fraction of an answer.
+  // Clamped because the two figures come from different moments: nodesWalked is
+  // from the walk, labelCount from the last schema discovery, and merges shrink
+  // the label in between.
+  const coveragePct =
+    labelCount && capture
+      ? Math.min(100, 100 * (1 - Math.pow(1 - Math.min(1, capture.nodesWalked / labelCount), 2))).toFixed(1)
+      : '0'
 
   const entries = Array.from(progress.values())
   const overallPct =
@@ -165,6 +183,36 @@ export default function ComputeScreen() {
                 </>
               )}
             </p>
+          </div>
+        )}
+
+        {done && dists?.candidates?.strategy === 'prefix' && (
+          <div className="bg-gray-900 border border-gray-800 rounded-xl px-4 py-3 space-y-1">
+            <p className="text-sm text-white">
+              {dists.candidates.complete
+                ? 'The whole label was walked'
+                : 'Part of the label was walked'}
+            </p>
+            <p className="text-xs text-gray-400">
+              {dists.candidates.nodes.toLocaleString()} nodes compared against everything sharing
+              their first {session?.blockingPrefixLength ?? 8} characters of{' '}
+              <span className="text-gray-300">{session?.blockingField}</span>, surfacing{' '}
+              {dists.candidates.pairs.toLocaleString()} pairs.
+              {!dists.candidates.complete && (
+                <>
+                  {' '}This pass stopped on its budget rather than at the end of the label. Review
+                  what it found, then capture more — the next pass resumes where this one stopped
+                  and adds to the same queue.
+                </>
+              )}
+            </p>
+            {!dists.candidates.complete && capture && (
+              <p className="text-xs text-gray-500 pt-0.5">
+                {capture.nodesWalked.toLocaleString()} of{' '}
+                {labelCount ? labelCount.toLocaleString() : '?'} nodes walked
+                {labelCount ? ` · ${coveragePct}% of pairs reachable so far` : ''}
+              </p>
+            )}
           </div>
         )}
 
