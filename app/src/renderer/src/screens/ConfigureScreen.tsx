@@ -11,6 +11,7 @@ import type {
   LlmCallRecord,
   PropertyKind,
   PairEstimate,
+  BlockingStrategy,
 } from '../../../shared/types'
 
 type Step = 'label' | 'fields' | 'surfacing'
@@ -63,6 +64,7 @@ export default function ConfigureScreen() {
   const [surfacingMode, setSurfacingMode] = useState<'any' | 'all' | 'weighted-average'>('any')
   const [fieldSurfacing, setFieldSurfacing] = useState<Record<string, { threshold: number; weight: number }>>({})
   const [combinedThreshold, setCombinedThreshold] = useState(0.85)
+  const [blocking, setBlocking] = useState<BlockingStrategy>('auto')
   const [estimate, setEstimate] = useState<PairEstimate | null>(null)
   const [estimating, setEstimating] = useState(false)
   const [creating, setCreating] = useState(false)
@@ -137,6 +139,7 @@ export default function ConfigureScreen() {
       sf[f.propertyName] = { threshold: f.threshold, weight: f.weight ?? (1 / session!.surfacingRule.fields.length) }
     }
     setFieldSurfacing(sf)
+    setBlocking(session!.blockingStrategy ?? 'auto')
     setSurfacingMode(session!.surfacingRule.mode)
     if (session!.surfacingRule.combinedThreshold != null) {
       setCombinedThreshold(session!.surfacingRule.combinedThreshold)
@@ -803,6 +806,34 @@ export default function ConfigureScreen() {
                 <span className="text-white font-medium">{combinedThreshold.toFixed(2)}</span>
               </label>
             )}
+
+            <div className="bg-gray-900 border border-gray-800 rounded-xl px-5 py-4 space-y-3">
+              <div>
+                <p className="text-sm font-medium text-white">Which pairs get compared</p>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  Decided before any threshold applies, so it bounds what the rule can ever surface.
+                </p>
+              </div>
+              {([
+                ['auto', 'Automatic', `Compare everything when the label is small enough, otherwise compare pairs sharing a word.`],
+                ['exhaustive', 'Every pair', `Nothing is ruled out before scoring. Finds pairs that share no word — which token comparison can never offer — at roughly twice the time and several times the memory. ${labelNodes > 0 ? `${labelNodes.toLocaleString()} nodes is ${Math.round((labelNodes * (labelNodes - 1)) / 2).toLocaleString()} comparisons.` : ''}`],
+                ['token-bucket', 'Pairs sharing a word', 'Only records with a word in common are compared. Fast on any label size, but two records spelled differently enough are never offered.'],
+              ] as [BlockingStrategy, string, string][]).map(([value, title, detail]) => (
+                <label key={value} className="flex items-start gap-3 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="blocking"
+                    className="mt-1"
+                    checked={blocking === value}
+                    onChange={() => setBlocking(value)}
+                  />
+                  <span className="min-w-0">
+                    <span className="text-sm text-gray-200">{title}</span>
+                    <span className="block text-xs text-gray-500">{detail}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
 
             {estimate?.projectedCandidates !== undefined &&
               estimate.projectedCandidates > MAX_CANDIDATE_PAIRS && (

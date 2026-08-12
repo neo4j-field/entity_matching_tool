@@ -10,7 +10,10 @@ function rowToSession(row: Record<string, unknown>): Session {
     id: row.id as string,
     connectionId: row.connection_id as string,
     label: row.label as string,
-    ...(JSON.parse(row.config_json as string) as Pick<Session, 'fields' | 'surfacingRule'>),
+    ...(JSON.parse(row.config_json as string) as Pick<
+      Session,
+      'fields' | 'surfacingRule' | 'blockingStrategy'
+    >),
     status: row.status as Session['status'],
     reviewCursor: row.review_cursor as number,
     reviewFilter: JSON.parse(row.review_filter as string),
@@ -39,13 +42,13 @@ export function createSession(partial: Omit<Session, 'id' | 'createdAt' | 'updat
   const db = getDb()
   const id = randomUUID()
   const now = Date.now()
-  const { fields, surfacingRule, ...rest } = partial
+  const { fields, surfacingRule, blockingStrategy, ...rest } = partial
   db.prepare(`
     INSERT INTO sessions(id, connection_id, label, config_json, status, review_cursor, review_filter, review_sort, merge_passes, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id, rest.connectionId, rest.label,
-    JSON.stringify({ fields, surfacingRule }),
+    JSON.stringify({ fields, surfacingRule, blockingStrategy }),
     rest.status,
     rest.reviewCursor,
     JSON.stringify(rest.reviewFilter),
@@ -64,7 +67,7 @@ export function loadSession(id: string): Session | null {
 
 export function saveSession(session: Session): void {
   const db = getDb()
-  const { fields, surfacingRule } = session
+  const { fields, surfacingRule, blockingStrategy } = session
   db.prepare(`
     UPDATE sessions SET
       config_json   = ?,
@@ -76,7 +79,7 @@ export function saveSession(session: Session): void {
       updated_at    = ?
     WHERE id = ?
   `).run(
-    JSON.stringify({ fields, surfacingRule }),
+    JSON.stringify({ fields, surfacingRule, blockingStrategy }),
     session.status,
     session.reviewCursor,
     JSON.stringify(session.reviewFilter),

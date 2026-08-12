@@ -89,6 +89,17 @@ export interface FieldSurfacingConfig {
   weight: number
 }
 
+/**
+ * How a session decides which pairs are worth scoring.
+ *
+ * 'auto' keeps the size-based choice: compare everything when the label is
+ * small enough to afford it, otherwise fall back to token bucketing. The other
+ * two override that, because the trade is a judgement about the data rather
+ * than about its size — a low threshold on a fuzzy metric finds pairs that share
+ * no word, and only exhaustive comparison will ever offer them.
+ */
+export type BlockingStrategy = 'auto' | 'exhaustive' | 'token-bucket'
+
 export interface SurfacingRule {
   mode: 'any' | 'all' | 'weighted-average'
   fields: FieldSurfacingConfig[]
@@ -109,6 +120,7 @@ export interface Session {
   label: string
   fields: FieldConfig[]
   surfacingRule: SurfacingRule
+  blockingStrategy?: BlockingStrategy
   status: SessionStatus
   reviewCursor: number
   reviewFilter: ReviewFilter

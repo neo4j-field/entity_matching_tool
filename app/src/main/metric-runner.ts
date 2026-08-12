@@ -229,11 +229,30 @@ async function seedExhaustivePairs(
   session: Session,
   pairScores: PairScoreMap
 ): Promise<{ nodes: number; pairs: number } | null> {
+  const strategy = session.blockingStrategy ?? 'auto'
+  if (strategy === 'token-bucket') return null
+
   const counted = await neo4jSession.run(
     `MATCH (n:\`${session.label}\`) RETURN count(n) AS total`
   )
   const total = toJsNumber(counted.records[0]?.get('total') ?? 0)
-  if (total < 2 || pairCount(total) > EXHAUSTIVE_PAIR_LIMIT) return null
+  if (total < 2) return null
+
+  // 'auto' declines above the limit and lets bucketing decide. An explicit
+  // choice is honoured up to the point where it cannot complete at all, and
+  // refused past it with the reason rather than by silently doing something
+  // else — the run would otherwise die inside candidate generation.
+  if (pairCount(total) > EXHAUSTIVE_PAIR_LIMIT) {
+    if (strategy === 'auto') return null
+    if (pairCount(total) > MAX_CANDIDATE_PAIRS) {
+      throw new Error(
+        `Comparing every pair of ${total.toLocaleString()} nodes is ` +
+          `${Math.round(pairCount(total)).toLocaleString()} comparisons, past the ` +
+          `${MAX_CANDIDATE_PAIRS.toLocaleString()} limit. Choose "pairs sharing a word" ` +
+          `instead, or narrow the label.`
+      )
+    }
+  }
 
   const ids: string[] = []
   for await (const r of neo4jSession.run(
