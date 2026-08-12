@@ -125,6 +125,12 @@ export interface CaptureState {
   cursorId: string | null
   nodesWalked: number
   complete: boolean
+  // What the walked pairs were scored against. Resuming is only coherent while
+  // this holds: change a field, a metric, or the blocking key and the pairs
+  // already captured answer a different question from the ones still to come.
+  // Thresholds are deliberately excluded — they re-filter scores rather than
+  // change them, so they do not invalidate a walk.
+  fingerprint?: string
 }
 
 export interface SurfacingRule {

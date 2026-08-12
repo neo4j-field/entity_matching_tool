@@ -1,3 +1,4 @@
+import { createHash } from 'crypto'
 import { int } from 'neo4j-driver'
 import { getDriver } from './connection-service'
 import { getCachedSchema } from './schema-service'
@@ -330,6 +331,7 @@ async function prefixBlockPairs(
     nodes: (prior?.nodesWalked ?? 0) + nodes,
     pairs: pairScores.size,
     capture: {
+      fingerprint: prior?.fingerprint,
       cursorValue: complete ? null : (cv as string | null),
       cursorId: complete ? null : cid,
       nodesWalked: (prior?.nodesWalked ?? 0) + nodes,
@@ -400,6 +402,28 @@ async function seedExhaustivePairs(
  * Walks the label in bounded batches, scoring and persisting each before asking
  * for the next, stopping on whichever budget is reached first.
  */
+// Identifies the configuration a walk was made under. Fields, metric ids, and
+// metric params are in it because they determine the scores; the blocking key
+// and prefix length because they determine which pairs are ever offered; the
+// label because it is what is being walked. Thresholds and the surfacing rule
+// are out — see CaptureState.fingerprint.
+function captureFingerprint(session: Session): string {
+  return createHash('sha1')
+    .update(
+      JSON.stringify({
+        label: session.label,
+        blockingField: session.blockingField,
+        blockingPrefixLength: session.blockingPrefixLength,
+        fields: session.fields.map((f) => ({
+          name: f.propertyName,
+          metrics: f.metrics.map((mc) => ({ id: mc.metricId, params: mc.params })),
+        })),
+      })
+    )
+    .digest('hex')
+    .slice(0, 12)
+}
+
 async function capturePrefix(
   neo4jSession: ReturnType<ReturnType<typeof getDriver>['session']>,
   session: Session,
@@ -409,8 +433,22 @@ async function capturePrefix(
   const allScores: PairScoreMap = new Map()
   const snapshotMap = new Map<string, NodeSnapshot>()
   let surfacedTotal = 0
-  let capture: CaptureState =
-    session.capture ?? { cursorValue: null, cursorId: null, nodesWalked: 0, complete: false }
+  const fingerprint = captureFingerprint(session)
+  // Resume only a walk that is both unfinished and made under this exact
+  // configuration. A finished one is not resumed but restarted: the only way
+  // back here with a complete capture is a deliberate re-run, and continuing
+  // from a spent cursor walked the label again while adding to the old count —
+  // 1,533 nodes walked on a 511-node label, and a coverage figure above 100%.
+  const priorCapture = session.capture
+  const resumable = priorCapture && priorCapture.fingerprint === fingerprint && !priorCapture.complete
+  if (priorCapture && !resumable) {
+    console.log(
+      `[compute] capture: restarting the walk (${priorCapture.complete ? 're-run of a finished capture' : 'configuration changed'})`
+    )
+  }
+  let capture: CaptureState = resumable
+    ? priorCapture!
+    : { cursorValue: null, cursorId: null, nodesWalked: 0, complete: false, fingerprint }
 
   const started = Date.now()
   for (;;) {
