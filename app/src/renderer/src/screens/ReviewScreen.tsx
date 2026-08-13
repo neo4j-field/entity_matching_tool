@@ -29,8 +29,15 @@ const VERDICT_COLORS: Record<Verdict, string> = {
   distinct: 'text-red-400',
 }
 
-function displayVal(props: Record<string, unknown>): string {
-  const v = props.name ?? props.title ?? props.heading ?? props.summary ?? props.text
+// Names a node in the queue. The well-known properties come first, then the
+// fields the session actually matched on, then any string it carries — a label
+// that names its entities something this list has never heard of still gets a
+// row a human can read. On Address, which has none of the five, every row read
+// as the last eight characters of an elementId.
+function displayVal(props: Record<string, unknown>, matchedFields: string[] = []): string {
+  let v = props.name ?? props.title ?? props.heading ?? props.summary ?? props.text
+  if (v == null) v = matchedFields.map((f) => props[f]).find((x) => x != null)
+  if (v == null) v = Object.values(props).find((x) => typeof x === 'string' && x.length > 0)
   if (v == null) return ''
   const s = String(v)
   return s.length > 80 ? s.slice(0, 80) + '…' : s
@@ -583,6 +590,7 @@ export default function ReviewScreen() {
   const [exporting, setExporting] = useState(false)
   const noteRef = useRef<HTMLTextAreaElement>(null)
 
+  const matchedFields = session?.fields.map((f) => f.propertyName) ?? []
   const hasApiKey = Boolean(settings?.anthropicApiKey)
   const pendingCount = pairs.filter((p) => p.verdict === 'pending').length
 
@@ -734,8 +742,8 @@ export default function ReviewScreen() {
         {/* Pair list */}
         <div className="flex-1 overflow-y-auto">
           {filteredPairs.map((pair, i) => {
-            const display = displayVal(pair.nodeA.properties) || pair.nodeA.id.slice(-8)
-            const displayB = displayVal(pair.nodeB.properties) || pair.nodeB.id.slice(-8)
+            const display = displayVal(pair.nodeA.properties, matchedFields) || pair.nodeA.id.slice(-8)
+            const displayB = displayVal(pair.nodeB.properties, matchedFields) || pair.nodeB.id.slice(-8)
             return (
               <button
                 key={pair.id}
