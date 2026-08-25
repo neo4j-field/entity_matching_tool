@@ -499,7 +499,13 @@ export default function ConfigureScreen() {
     setCreating(true)
     try {
       let activeSession
-      if (isRerun && session) {
+      // Update whenever we already hold a session, not only when it has been
+      // reviewed. A session is created before compute runs, so a compute that
+      // fails leaves one behind in 'configuring' with no pairs — and pressing
+      // Start Compute again used to create another. Four failed attempts made
+      // four identical sessions. Starting genuinely fresh clears the store
+      // first (newSession), so a session here is always the one being edited.
+      if (session) {
         // Update the existing session in-place — preserves all pair verdicts
         const partial = buildSessionPartial()
         activeSession = {
@@ -509,6 +515,7 @@ export default function ConfigureScreen() {
           blockingStrategy: partial.blockingStrategy,
           blockingField: partial.blockingField,
           blockingPrefixLength: partial.blockingPrefixLength,
+          legs: partial.legs,
           updatedAt: new Date().toISOString(),
         }
         await window.api.session.save(activeSession)
