@@ -9,6 +9,7 @@ import type {
   PropertyKind,
   PropertyIndexKind,
   RelTypeMeta,
+  RelPattern,
 } from '../shared/types'
 
 let _cached: SchemaModel | null = null
@@ -265,6 +266,28 @@ export async function discoverSchema(): Promise<SchemaModel> {
         relMap.set(relType, { name: relType, startLabels: [], endLabels: [] })
       }
     }
+
+    // Which labels each type actually connects. apoc.meta.relTypeProperties and
+    // db.schema.relTypeProperties both yield only the type and its properties,
+    // so this was previously unknowable and startLabels/endLabels were always
+    // empty. db.schema.visualization() is the only source that gives endpoints
+    // with a direction, and it is built in — no new APOC dependency on a path
+    // that already degrades 6s to 46s without it. Measured: 1825ms cold and
+    // 156ms warm on a 9M-node database.
+    const tViz = Date.now()
+    const relPatterns = await discoverRelPatterns(session, excludedLabels)
+    queryCount++
+    for (const pat of relPatterns) {
+      const entry = relMap.get(pat.relType) ?? { name: pat.relType, startLabels: [], endLabels: [] }
+      if (!entry.startLabels.includes(pat.startLabel)) entry.startLabels.push(pat.startLabel)
+      if (!entry.endLabels.includes(pat.endLabel)) entry.endLabels.push(pat.endLabel)
+      relMap.set(pat.relType, entry)
+    }
+    console.log(
+      `[schema] ${relPatterns.length} relationship patterns via db.schema.visualization() ` +
+        `in ${Date.now() - tViz}ms`
+    )
+
     const relationshipTypes = Array.from(relMap.values())
 
     console.log(
@@ -272,7 +295,13 @@ export async function discoverSchema(): Promise<SchemaModel> {
         `in ${Date.now() - startedAt}ms across ${queryCount} queries`
     )
 
-    _cached = { labels, relationshipTypes, discoveredAt: new Date().toISOString(), apocAvailable }
+    _cached = {
+      labels,
+      relationshipTypes,
+      relPatterns,
+      discoveredAt: new Date().toISOString(),
+      apocAvailable,
+    }
     return _cached
   } finally {
     await session.close()
@@ -339,4 +368,85 @@ function inferKind(meta: PropertyMeta): PropertyKind {
   if (avgLen < 20 && identifierLike > 0.5) return 'identifier'
   if (avgLen > 100) return 'text'
   return 'name'
+}
+
+/**
+ * Directed (start)-[:TYPE]->(end) shapes, from the built-in schema procedure.
+ *
+ * Patterns touching an excluded label are dropped here rather than by the
+ * caller: on a GraphRAG database 11 of 43 patterns are FROM_CHUNK plumbing, and
+ * on a database this tool has written back to, its own ERPair and ERPairScore
+ * nodes appear as candidates.
+ *
+ * Failure is not fatal. A database that cannot run the procedure keeps every
+ * other part of discovery; callers see an empty list and offer no patterns.
+ */
+async function discoverRelPatterns(
+  session: ReturnType<ReturnType<typeof getDriver>['session']>,
+  excludedLabels: string[]
+): Promise<RelPattern[]> {
+  let result
+  try {
+    result = await session.run('CALL db.schema.visualization()')
+  } catch (err) {
+    console.log(`[schema] db.schema.visualization() unavailable: ${(err as Error).message}`)
+    return []
+  }
+  const record = result.records[0]
+  if (!record) return []
+
+  // Relationships carry the identities of their endpoints, not the nodes, so
+  // they have to be resolved through the node list in the same row.
+  // One node per label is what the procedure returns. Anything else is a shape
+  // this does not understand, and joining the labels would invent a name no
+  // database has — so skip it rather than offer a pattern that cannot match.
+  const labelById = new Map<string, string>()
+  for (const node of (record.get('nodes') ?? []) as { identity: unknown; labels: string[] }[]) {
+    if (node.labels.length !== 1) {
+      console.log(`[schema] skipping schema node with ${node.labels.length} labels: ${node.labels.join(', ')}`)
+      continue
+    }
+    labelById.set(String(node.identity), node.labels[0])
+  }
+
+  const patterns: RelPattern[] = []
+  const seen = new Set<string>()
+  for (const rel of (record.get('relationships') ?? []) as {
+    start: unknown
+    end: unknown
+    type: string
+  }[]) {
+    const startLabel = labelById.get(String(rel.start))
+    const endLabel = labelById.get(String(rel.end))
+    if (!startLabel || !endLabel) continue
+    if (excludedLabels.includes(startLabel) || excludedLabels.includes(endLabel)) continue
+    const key = `${startLabel}|${rel.type}|${endLabel}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    patterns.push({ relType: rel.type, startLabel, endLabel })
+  }
+  return patterns
+}
+
+/**
+ * Whether a pattern has any data at all.
+ *
+ * db.schema.visualization() reports label-pair combinations rather than only
+ * observed ones: on one test database 5 of 43 patterns matched nothing, among
+ * them (Occurrence)-[:PART_OF]->(Aircraft). Configuring one of those would
+ * produce a session that silently surfaces no pairs — no error, an empty queue,
+ * the same failure mode as a blocking key with no index. Check before offering
+ * a pattern as usable. Measured at 208-640ms per pattern on a 9M-node database.
+ */
+export async function relPatternHasData(pattern: RelPattern): Promise<boolean> {
+  const session = getDriver().session()
+  try {
+    const result = await session.run(
+      `MATCH (a:\`${pattern.startLabel}\`)-[:\`${pattern.relType}\`]->(b:\`${pattern.endLabel}\`) ` +
+        `RETURN 1 AS ok LIMIT 1`
+    )
+    return result.records.length > 0
+  } finally {
+    await session.close()
+  }
 }

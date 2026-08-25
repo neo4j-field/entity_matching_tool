@@ -12,6 +12,7 @@ export const IPC = {
 
   // Schema
   SCHEMA_DISCOVER: 'schema:discover',
+  SCHEMA_VALIDATE_PATTERN: 'schema:validatePattern',
   SCHEMA_ESTIMATE_PAIRS: 'schema:estimatePairs',
 
   // Session

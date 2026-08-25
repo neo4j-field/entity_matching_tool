@@ -40,13 +40,36 @@ export interface LabelMeta {
 
 export interface RelTypeMeta {
   name: string
+  // Every label observed at each end of this type, across all its patterns.
+  // Useful for a summary; not enough to build a pattern from — see RelPattern.
   startLabels: string[]
   endLabels: string[]
+}
+
+/**
+ * One directed (start)-[:TYPE]->(end) shape the database reports.
+ *
+ * Kept as triples rather than as two label lists per type, because the lists
+ * only express their cross-product. PREVIOUSLY_NAMED runs Company→PreviousName
+ * and Company→Company; a type with two starts and two ends implies four
+ * patterns where only two exist, which is the phantom problem below.
+ *
+ * `db.schema.visualization()` reports combinations rather than only observed
+ * ones, so some of these have no data — 5 of 43 on one test database. Confirm
+ * with `relPatternHasData()` before offering a pattern as usable.
+ */
+export interface RelPattern {
+  relType: string
+  startLabel: string
+  endLabel: string
 }
 
 export interface SchemaModel {
   labels: LabelMeta[]
   relationshipTypes: RelTypeMeta[]
+  // Directed shapes connecting two non-excluded labels. Empty when the database
+  // does not support db.schema.visualization().
+  relPatterns: RelPattern[]
   discoveredAt: string // ISO string
   apocAvailable: boolean
 }

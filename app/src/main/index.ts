@@ -29,6 +29,7 @@ import type {
   ClassifyPlan,
   JobEstimate,
   LlmJobKind,
+  RelPattern,
 } from '../shared/types'
 
 let mainWindow: BrowserWindow | null = null
@@ -293,6 +294,11 @@ function registerIpc() {
 
   // Schema
   ipcMain.handle(IPC.SCHEMA_DISCOVER, () => schema.discoverSchema())
+  // A pattern the schema reports may still match nothing — visualization()
+  // returns label-pair combinations, not only observed ones.
+  ipcMain.handle(IPC.SCHEMA_VALIDATE_PATTERN, async (_, pattern: RelPattern) =>
+    schema.relPatternHasData(pattern)
+  )
   ipcMain.handle(IPC.SCHEMA_ESTIMATE_PAIRS, async (_, sessionId: string) => {
     const session = sessions.loadSession(sessionId)
     if (!session) return { count: 0, exact: true, candidates: 0 }
