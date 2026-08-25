@@ -291,19 +291,32 @@ async function prefixBlockPairs(
   // The cursor is (value, elementId) rather than value alone, because a batch
   // boundary can fall inside a run of equal values and `n.f > $cursor` would
   // skip every node sharing the boundary value.
+  //
+  // Partners are limited inside a per-node subquery rather than by slicing a
+  // collect(). Collecting first and slicing after materialises every partner of
+  // every node in the batch on the server before throwing all but 50 away: on a
+  // dense block that is the whole block per node, 5,000 times over, and it blew
+  // a 278 MiB transaction limit in 1.1s at prefix length 2. The subquery stops
+  // reading at PREFIX_BLOCK_LIMIT rows.
+  //
+  // It ends in an aggregation, which is what keeps a node with no partners in
+  // the result: an aggregating subquery always returns exactly one row, where a
+  // plain MATCH would drop the node. A batch that returned nothing would leave
+  // the cursor unable to advance and end the walk early.
   const q =
     `MATCH (n:\`${label}\`) WHERE n.\`${field}\` IS NOT NULL\n` +
     `  AND ($cv IS NULL OR n.\`${field}\` > $cv\n` +
     `       OR (n.\`${field}\` = $cv AND elementId(n) > $cid))\n` +
     `WITH n ORDER BY n.\`${field}\`, elementId(n) LIMIT $batch\n` +
     `WITH n, left(n.\`${field}\`, ${prefix}) AS block\n` +
-    // OPTIONAL, so a node with no partners still returns a row. A plain MATCH
-    // drops them, and a batch where nothing matched would return nothing at all
-    // — leaving the cursor unable to advance and ending the walk early.
-    `OPTIONAL MATCH (m:\`${label}\`) WHERE m.\`${field}\` STARTS WITH block\n` +
-    `  AND (n.\`${field}\` < m.\`${field}\`\n` +
-    `       OR (n.\`${field}\` = m.\`${field}\` AND elementId(n) < elementId(m)))\n` +
-    `WITH n, [x IN collect(elementId(m)) WHERE x IS NOT NULL][..${PREFIX_BLOCK_LIMIT}] AS partners\n` +
+    `CALL {\n` +
+    `  WITH n, block\n` +
+    `  MATCH (m:\`${label}\`) WHERE m.\`${field}\` STARTS WITH block\n` +
+    `    AND (n.\`${field}\` < m.\`${field}\`\n` +
+    `         OR (n.\`${field}\` = m.\`${field}\` AND elementId(n) < elementId(m)))\n` +
+    `  WITH m LIMIT ${PREFIX_BLOCK_LIMIT}\n` +
+    `  RETURN collect(elementId(m)) AS partners\n` +
+    `}\n` +
     `RETURN elementId(n) AS id, n.\`${field}\` AS v, partners`
 
   // Resume where the last pass stopped. Pairs are produced only from the member
