@@ -1,4 +1,5 @@
 import { getMetric } from './metrics/registry'
+import { fieldKey } from '../shared/field-key'
 import type {
   CandidatePair,
   LabelMeta,
@@ -171,7 +172,7 @@ function metricLines(session: Session): string {
           // A metric removed from the registry should degrade the prompt, not
           // break the run.
         }
-        return `  - ${f.propertyName} · ${m.metricId} (threshold ${m.threshold})${
+        return `  - ${fieldKey(f)} · ${m.metricId} (threshold ${m.threshold})${
           description ? `: ${description}` : ''
         }`
       })
@@ -215,7 +216,7 @@ export function buildPrefix(input: PrefixInput): {
   const fieldTypes = session.fields
     .map((f) => {
       const types = labelMeta?.properties.find((p) => p.name === f.propertyName)?.types
-      return `  - ${f.propertyName} (${types?.join(', ') ?? 'String'})`
+      return `  - ${fieldKey(f)} (${types?.join(', ') ?? 'String'})`
     })
     .join('\n')
 

@@ -109,13 +109,30 @@ export interface MetricConfig {
   threshold: number
 }
 
+/**
+ * One node of the pattern a session matches on, other than the primary label.
+ *
+ * Exactly one hop from the primary node — legs never chain, so a cycle cannot
+ * extend. The alias is the field-key namespace and is embedded in stored score
+ * rows, so it is unique within a session and immutable once anything is scored.
+ */
+export interface PatternLeg {
+  alias: string
+  relType: string
+  direction: 'out' | 'in'
+  label: string
+}
+
 export interface FieldConfig {
   propertyName: string
+  // Absent = a property of the primary label. See fieldKey().
+  legAlias?: string
   metrics: MetricConfig[]
 }
 
 export interface FieldSurfacingConfig {
   propertyName: string
+  legAlias?: string
   threshold: number
   weight: number
 }
@@ -192,6 +209,8 @@ export interface Session {
   // 0.17ms per node.
   blockingField?: string
   blockingPrefixLength?: number
+  // Related nodes contributing fields. Absent for a single-label session.
+  legs?: PatternLeg[]
   capture?: CaptureState
   status: SessionStatus
   reviewCursor: number

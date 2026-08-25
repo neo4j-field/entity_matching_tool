@@ -1,6 +1,7 @@
 import { getDb } from './db'
 import { getDriver } from './connection-service'
 import { applySurfacingRule, loadSnapshots } from './metric-runner'
+import { fieldKey } from '../shared/field-key'
 import type { MetricScore, NodeSnapshot, RefilterResult, Session } from '../shared/types'
 
 /**
@@ -45,9 +46,16 @@ export async function refilterPairs(session: Session, signal?: AbortSignal): Pro
   // Current per-metric thresholds, for the aboveThreshold flag the review screen
   // colours by. Recomputed here because it is threshold-dependent and so goes
   // stale the moment a threshold moves.
+  //
+  // Held as a list rather than only as a joined-key map, because splitting the
+  // key back apart would break the moment a field key contains the separator.
+  const thresholdList: { fieldName: string; metricId: string; threshold: number }[] = []
   const thresholds = new Map<string, number>()
   for (const f of session.fields) {
-    for (const m of f.metrics) thresholds.set(`${f.propertyName}|${m.metricId}`, m.threshold)
+    for (const m of f.metrics) {
+      thresholdList.push({ fieldName: fieldKey(f), metricId: m.metricId, threshold: m.threshold })
+      thresholds.set(`${fieldKey(f)}|${m.metricId}`, m.threshold)
+    }
   }
 
   console.log(`[refilter] read ${pairs.length} pairs and ${scoreRows.length} scores in ${Date.now() - t0}ms`)
@@ -113,9 +121,8 @@ export async function refilterPairs(session: Session, signal?: AbortSignal): Pro
   `)
   db.transaction(() => {
     for (const u of updates) setSurfaced.run(u.surfaced, u.id)
-    for (const [key, threshold] of thresholds) {
-      const [fieldName, metricId] = key.split('|')
-      setScoreFlags.run(threshold, fieldName, metricId, session.id)
+    for (const t of thresholdList) {
+      setScoreFlags.run(t.threshold, t.fieldName, t.metricId, session.id)
     }
   })()
 

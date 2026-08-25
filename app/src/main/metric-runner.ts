@@ -1,3 +1,4 @@
+import { fieldKey } from '../shared/field-key'
 import { createHash } from 'crypto'
 import { int } from 'neo4j-driver'
 import { getDriver } from './connection-service'
@@ -83,7 +84,7 @@ export async function runMetrics(
     for (const fieldConfig of session.fields) {
       for (const metricConfig of fieldConfig.metrics) {
         // Signal that this metric has started so the UI shows it at 0% immediately
-        onProgress({ metricId: metricConfig.metricId, fieldName: fieldConfig.propertyName, pct: 0, pairsAbove: 0 })
+        onProgress({ metricId: metricConfig.metricId, fieldName: fieldKey(fieldConfig), pct: 0, pairsAbove: 0 })
       }
 
       // Id and the one value this field needs, nothing else.
@@ -112,7 +113,7 @@ export async function runMetrics(
       console.log(`[compute] ${nodes.length} nodes fetched for ${fieldConfig.propertyName} in ${Date.now() - tFetch}ms`)
       // The query above already filters to nodes that have the property, so this
       // is the exact set for which the field can be compared at all.
-      fieldNodeIds.set(fieldConfig.propertyName, new Set(nodes.map((n) => n.id)))
+      fieldNodeIds.set(fieldKey(fieldConfig), new Set(nodes.map((n) => n.id)))
 
       for (const metricConfig of fieldConfig.metrics) {
         if (signal.aborted) break
@@ -124,7 +125,7 @@ export async function runMetrics(
           rawScores = await metric.computePairScores(
             nodes,
             metricConfig.params,
-            (pct) => onProgress({ metricId: metricConfig.metricId, fieldName: fieldConfig.propertyName, pct, pairsAbove: 0 }),
+            (pct) => onProgress({ metricId: metricConfig.metricId, fieldName: fieldKey(fieldConfig), pct, pairsAbove: 0 }),
             signal
           )
         } catch (err) {
@@ -143,7 +144,7 @@ export async function runMetrics(
           if (!pairScores.has(pairId)) pairScores.set(pairId, { idA, idB, scores: [] })
           pairScores.get(pairId)!.scores.push({
             metricId: metricConfig.metricId,
-            fieldName: fieldConfig.propertyName,
+            fieldName: fieldKey(fieldConfig),
             score,
             aboveThreshold: score >= metricConfig.threshold,
           })
@@ -415,8 +416,9 @@ function captureFingerprint(session: Session): string {
         label: session.label,
         blockingField: session.blockingField,
         blockingPrefixLength: session.blockingPrefixLength,
+        legs: session.legs,
         fields: session.fields.map((f) => ({
-          name: f.propertyName,
+          name: fieldKey(f),
           metrics: f.metrics.map((mc) => ({ id: mc.metricId, params: mc.params })),
         })),
       })
@@ -537,7 +539,7 @@ function fieldPresence(
     for (const [id, snap] of snapshots) {
       if (snap.properties[fc.propertyName] !== undefined) ids.add(id)
     }
-    m.set(fc.propertyName, ids)
+    m.set(fieldKey(fc), ids)
   }
   return m
 }
@@ -577,7 +579,7 @@ async function scoreAndSurface(
         for (const [id, snap] of snapshotMap) {
           if (snap.properties[fc.propertyName] !== undefined) ids.add(id)
         }
-        m.set(fc.propertyName, ids)
+        m.set(fieldKey(fc), ids)
       }
       return m
     })()
@@ -654,9 +656,9 @@ function surfaced(
   fieldNodeIds: Map<string, Set<string>>,
   abstained?: Set<string>
 ): boolean {
-  return applySurfacingRule(scores, session, (propertyName) => {
-    if (abstained?.has(propertyName)) return false
-    const ids = fieldNodeIds.get(propertyName)
+  return applySurfacingRule(scores, session, (key) => {
+    if (abstained?.has(key)) return false
+    const ids = fieldNodeIds.get(key)
     return ids !== undefined && ids.has(idA) && ids.has(idB)
   })
 }
@@ -674,7 +676,7 @@ function surfaced(
 export function applySurfacingRule(
   scores: MetricScore[],
   session: Session,
-  comparable: (propertyName: string) => boolean
+  comparable: (fieldKeyOf: string) => boolean
 ): boolean {
   const { mode, fields } = session.surfacingRule
 
@@ -687,7 +689,7 @@ export function applySurfacingRule(
 
   if (mode === 'any') {
     for (const fc of fields) {
-      const fs = fieldScores.get(fc.propertyName) ?? 0
+      const fs = fieldScores.get(fieldKey(fc)) ?? 0
       if (fs >= fc.threshold) return true
     }
     return false
@@ -701,9 +703,9 @@ export function applySurfacingRule(
     // failure: that is a real comparison the pair lost.
     let compared = 0
     for (const fc of fields) {
-      if (!comparable(fc.propertyName)) continue
+      if (!comparable(fieldKey(fc))) continue
       compared++
-      if ((fieldScores.get(fc.propertyName) ?? 0) < fc.threshold) return false
+      if ((fieldScores.get(fieldKey(fc)) ?? 0) < fc.threshold) return false
     }
     return compared > 0
   }
@@ -722,11 +724,11 @@ export function applySurfacingRule(
   // already skipped those for exactly the reason stated above, and the two modes
   // disagreeing on what "cannot be judged" means is what made a re-filter unable
   // to reproduce compute's own verdict.
-  const usable = fields.filter((fc) => comparable(fc.propertyName))
+  const usable = fields.filter((fc) => comparable(fieldKey(fc)))
   const totalWeight = usable.reduce((sum, fc) => sum + fc.weight, 0)
   if (totalWeight <= 0) return false
   const weighted = usable.reduce((sum, fc) => {
-    return sum + fc.weight * (fieldScores.get(fc.propertyName) ?? 0)
+    return sum + fc.weight * (fieldScores.get(fieldKey(fc)) ?? 0)
   }, 0)
   return weighted / totalWeight >= (session.surfacingRule.combinedThreshold ?? 0.85)
 }
@@ -802,24 +804,24 @@ function densify(session: Session, pairScores: PairScoreMap, snapshots: Map<stri
       if (a === undefined || b === undefined) continue
 
       for (const metricConfig of fieldConfig.metrics) {
-        if (have.has(`${fieldConfig.propertyName}|${metricConfig.metricId}`)) continue
+        if (have.has(`${fieldKey(fieldConfig)}|${metricConfig.metricId}`)) continue
         const metric = getMetric(metricConfig.metricId)
         if (!metric.scorePair) continue
         const score = metric.scorePair(a, b, metricConfig.params)
         if (score === null) continue
         scores.push({
           metricId: metricConfig.metricId,
-          fieldName: fieldConfig.propertyName,
+          fieldName: fieldKey(fieldConfig),
           score,
           aboveThreshold: score >= metricConfig.threshold,
         })
-        scoredFields.add(fieldConfig.propertyName)
+        scoredFields.add(fieldKey(fieldConfig))
         densified++
       }
 
-      if (!scoredFields.has(fieldConfig.propertyName)) {
+      if (!scoredFields.has(fieldKey(fieldConfig))) {
         if (!entry.abstained) entry.abstained = new Set()
-        entry.abstained.add(fieldConfig.propertyName)
+        entry.abstained.add(fieldKey(fieldConfig))
       }
     }
   }
@@ -1066,7 +1068,7 @@ async function surfacedCount(session: Session, nodes: NodeSnapshot[]): Promise<n
 
   for (const fieldConfig of session.fields) {
     const present = nodes.filter((n) => n.properties[fieldConfig.propertyName] !== undefined)
-    fieldNodeIds.set(fieldConfig.propertyName, new Set(present.map((n) => n.id)))
+    fieldNodeIds.set(fieldKey(fieldConfig), new Set(present.map((n) => n.id)))
     if (present.length < 2) continue
 
     const records: NodeRecord[] = present.map((n) => ({
@@ -1083,7 +1085,7 @@ async function surfacedCount(session: Session, nodes: NodeSnapshot[]): Promise<n
         if (!pairScores.has(pairId)) pairScores.set(pairId, { idA, idB, scores: [] })
         pairScores.get(pairId)!.scores.push({
           metricId: metricConfig.metricId,
-          fieldName: fieldConfig.propertyName,
+          fieldName: fieldKey(fieldConfig),
           score,
           aboveThreshold: score >= metricConfig.threshold,
         })

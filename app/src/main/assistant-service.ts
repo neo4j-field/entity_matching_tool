@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { getSettings } from './settings-service'
+import { fieldKey } from '../shared/field-key'
 import { loadSession, listPairs } from './session-service'
 import { getCachedSchema } from './schema-service'
 import { recordCall, tokensFromUsage, emptyTokens } from './usage-service'
@@ -13,7 +14,7 @@ function buildSystemPrompt(
   const { fields, surfacingRule, label } = session
 
   const metricLines = fields.flatMap((f) =>
-    f.metrics.map((m) => `    ${f.propertyName} · ${m.metricId} [threshold ${m.threshold}]`)
+    f.metrics.map((m) => `    ${fieldKey(f)} · ${m.metricId} [threshold ${m.threshold}]`)
   ).join('\n')
 
   const pairs = listPairs(session.id)

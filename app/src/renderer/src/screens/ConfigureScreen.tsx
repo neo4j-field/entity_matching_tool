@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useStore } from '../store'
+import { fieldKey } from '../../../shared/field-key'
 import { METRICS, suggestMetrics, getMetricDef } from '../lib/metrics'
 import { formatUsd, summarizeTokens } from '../lib/usage'
 import { MAX_CANDIDATE_PAIRS } from '../../../shared/constants'
@@ -628,7 +629,7 @@ export default function ConfigureScreen() {
                       {field.metrics.map((fm) => {
                         const def = getMetricDef(fm.metricId)
                         if (!def) return null
-                        const key = `${field.propertyName}:${fm.metricId}`
+                        const key = `${fieldKey(field)}:${fm.metricId}`
                         const expanded = expandedMetric === key
                         return (
                           <div key={fm.metricId} className="bg-gray-950 rounded-lg p-3 space-y-2">
