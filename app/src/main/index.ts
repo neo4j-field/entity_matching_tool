@@ -3,6 +3,7 @@ import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { IPC } from '../shared/ipc-channels'
 import { refilterPairs } from './refilter-service'
+import { fieldKey } from '../shared/field-key'
 import * as connection from './connection-service'
 import * as schema from './schema-service'
 import * as sessions from './session-service'
@@ -30,6 +31,7 @@ import type {
   JobEstimate,
   LlmJobKind,
   RelPattern,
+  NodeSnapshot,
 } from '../shared/types'
 
 let mainWindow: BrowserWindow | null = null
@@ -373,8 +375,18 @@ function registerIpc() {
     // scores with nothing to read them against — and on a label with no `name`
     // it carried nothing identifying at all, because the display fallback below
     // only ever knew a handful of property names.
-    const matchedFields = sessions.loadSession(sessionId)?.fields.map((f) => f.propertyName) ?? []
-    const fieldColumns = matchedFields.flatMap((f) => [`node_a_${f}`, `node_b_${f}`])
+    const matchedFields = sessions.loadSession(sessionId)?.fields ?? []
+    const fieldColumns = matchedFields.flatMap((f) => [`node_a_${fieldKey(f)}`, `node_b_${fieldKey(f)}`])
+    // A related field's value is the list its leg reaches, so it is joined into
+    // one cell rather than given a column per related node.
+    const valueOf = (snap: NodeSnapshot, f: { propertyName: string; legAlias?: string }): string => {
+      if (!f.legAlias) return snap.properties[f.propertyName] == null ? '' : String(snap.properties[f.propertyName])
+      return (snap.related?.[f.legAlias] ?? [])
+        .map((r) => r.properties[f.propertyName])
+        .filter((v) => v != null)
+        .map(String)
+        .join(', ')
+    }
     const header = [
       'pair_id', 'node_a_id', 'node_a_display', 'node_b_id', 'node_b_display',
       'verdict', 'decided_at', 'note', ...fieldColumns, ...allMetricKeys,
@@ -386,19 +398,18 @@ function registerIpc() {
       const known = props.name ?? props.title ?? props.heading ?? props.summary ?? props.text
       if (known != null) return String(known)
       for (const f of matchedFields) {
-        if (props[f] != null) return String(props[f])
+        if (!f.legAlias && props[f.propertyName] != null) return String(props[f.propertyName])
       }
       const firstString = Object.values(props).find((v) => typeof v === 'string' && v.length > 0)
       return firstString === undefined ? '' : String(firstString)
     }
-    const cell = (v: unknown): string => (v == null ? '' : String(v))
     const rows = filtered.map((p) => {
       const scoreMap = Object.fromEntries(p.scores.map((s) => [`${s.metricId}_${s.fieldName}`, s.score]))
       return [
         p.id, p.nodeA.id, displayVal(p.nodeA.properties),
         p.nodeB.id, displayVal(p.nodeB.properties),
         p.verdict, p.decidedAt ?? '', p.note ?? '',
-        ...matchedFields.flatMap((f) => [cell(p.nodeA.properties[f]), cell(p.nodeB.properties[f])]),
+        ...matchedFields.flatMap((f) => [valueOf(p.nodeA, f), valueOf(p.nodeB, f)]),
         ...allMetricKeys.map((k) => scoreMap[k] ?? ''),
       ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')
     })

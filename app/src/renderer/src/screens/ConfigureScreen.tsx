@@ -11,6 +11,7 @@ import type {
   SurfacingRule,
   LlmCallRecord,
   PropertyKind,
+  PatternLeg,
   PairEstimate,
   BlockingStrategy,
 } from '../../../shared/types'
@@ -25,9 +26,19 @@ interface DraftMetric {
 
 interface DraftField {
   propertyName: string
+  // Absent for a property of the primary label; otherwise the leg it came from.
+  legAlias?: string
   enabled: boolean
   metrics: DraftMetric[]
   kind: string
+}
+
+// A leg the user has added, with whether the database actually has data for it.
+// db.schema.visualization() reports label-pair combinations rather than only
+// observed ones, so roughly one in eight matches nothing — configuring one of
+// those produces a session that surfaces no pairs and reports no error.
+interface DraftLeg extends PatternLeg {
+  status: 'checking' | 'live' | 'empty'
 }
 
 const SKIP_KINDS = ['boolean']
@@ -62,6 +73,7 @@ export default function ConfigureScreen() {
   const [step, setStep] = useState<Step>('label')
   const [selectedLabel, setSelectedLabel] = useState<LabelMeta | null>(null)
   const [fields, setFields] = useState<DraftField[]>([])
+  const [legs, setLegs] = useState<DraftLeg[]>([])
   const [surfacingMode, setSurfacingMode] = useState<'any' | 'all' | 'weighted-average'>('any')
   const [fieldSurfacing, setFieldSurfacing] = useState<Record<string, { threshold: number; weight: number }>>({})
   const [combinedThreshold, setCombinedThreshold] = useState(0.85)
@@ -123,9 +135,14 @@ export default function ConfigureScreen() {
 
     // Show every comparable property, not just the ones the session kept —
     // otherwise a field deselected on an earlier pass can never be selected again.
-    const saved = new Map(session!.fields.map((fc) => [fc.propertyName, fc]))
+    // Restore the pattern first: a saved related field has to find its leg.
+    const savedLegs: DraftLeg[] = (session!.legs ?? []).map((l) => ({ ...l, status: 'live' }))
+    setLegs(savedLegs)
+
+    const saved = new Map(session!.fields.map((fc) => [fieldKey(fc), fc]))
     const fromSaved = (fc: FieldConfig, kind: PropertyKind): DraftField => ({
       propertyName: fc.propertyName,
+      legAlias: fc.legAlias,
       enabled: true,
       kind,
       metrics: fc.metrics.map((m) => ({ metricId: m.metricId, params: { ...m.params }, threshold: m.threshold })),
@@ -149,15 +166,33 @@ export default function ConfigureScreen() {
         }
       })
 
+    // Every property of each saved leg, so a related field deselected on an
+    // earlier pass can be selected again — the same reason the primary label
+    // lists all of its properties rather than only the kept ones.
+    for (const leg of savedLegs) {
+      const legLabel = schema?.labels.find((l) => l.name === leg.label)
+      for (const prop of legLabel?.properties ?? []) {
+        if (SKIP_KINDS.includes(prop.inferredKind)) continue
+        const key = `${leg.alias}.${prop.name}`
+        const fc = saved.get(key)
+        if (fc) { draft.push(fromSaved(fc, prop.inferredKind)); continue }
+        const suggested = suggestMetrics(prop.inferredKind)
+        draft.push({
+          propertyName: prop.name, legAlias: leg.alias, enabled: false, kind: prop.inferredKind,
+          metrics: suggested.map((m) => ({ metricId: m.id, params: { ...m.defaultParams }, threshold: m.defaultThreshold })),
+        })
+      }
+    }
+
     // A saved field the schema no longer reports still has verdicts riding on it.
     for (const fc of session!.fields) {
-      if (!draft.some((d) => d.propertyName === fc.propertyName)) draft.push(fromSaved(fc, 'name'))
+      if (!draft.some((d) => fieldKey(d) === fieldKey(fc))) draft.push(fromSaved(fc, 'name'))
     }
     setFields(draft)
 
     const sf: Record<string, { threshold: number; weight: number }> = {}
     for (const f of session!.surfacingRule.fields) {
-      sf[f.propertyName] = { threshold: f.threshold, weight: f.weight ?? (1 / session!.surfacingRule.fields.length) }
+      sf[fieldKey(f)] = { threshold: f.threshold, weight: f.weight ?? (1 / session!.surfacingRule.fields.length) }
     }
     setFieldSurfacing(sf)
     setBlocking(session!.blockingStrategy ?? 'auto')
@@ -197,19 +232,81 @@ export default function ConfigureScreen() {
     // Initialize surfacing per-field configs
     const sf: Record<string, { threshold: number; weight: number }> = {}
     for (const f of draft) {
-      sf[f.propertyName] = { threshold: 0.8, weight: 1 / Math.max(draft.length, 1) }
+      sf[fieldKey(f)] = { threshold: 0.8, weight: 1 / Math.max(draft.length, 1) }
     }
     setFieldSurfacing(sf)
     setStep('fields')
   }
 
-  function toggleField(name: string) {
-    setFields((prev) => prev.map((f) => f.propertyName === name ? { ...f, enabled: !f.enabled } : f))
+  // Legs available from the primary label, in either direction. Both ends are
+  // offered because the useful relationship is as often incoming — an Address
+  // that companies point at, an Officer who points at companies.
+  const availableLegs = (schema?.relPatterns ?? []).flatMap((pat) => {
+    const out: { relType: string; direction: 'out' | 'in'; label: string }[] = []
+    if (pat.startLabel === selectedLabel?.name) out.push({ relType: pat.relType, direction: 'out', label: pat.endLabel })
+    if (pat.endLabel === selectedLabel?.name) out.push({ relType: pat.relType, direction: 'in', label: pat.startLabel })
+    return out
+  }).filter((cand) => !legs.some((l) =>
+    l.relType === cand.relType && l.direction === cand.direction && l.label === cand.label
+  ))
+
+  // The alias namespaces this leg's field keys and is stored in every score row,
+  // so it has to be unique and stable. Derived from the label rather than typed,
+  // to keep it out of the user's hands once anything is scored.
+  function aliasFor(label: string): string {
+    const base = label.charAt(0).toLowerCase() + label.slice(1)
+    if (!legs.some((l) => l.alias === base)) return base
+    let n = 2
+    while (legs.some((l) => l.alias === `${base}${n}`)) n++
+    return `${base}${n}`
+  }
+
+  async function addLeg(cand: { relType: string; direction: 'out' | 'in'; label: string }): Promise<void> {
+    const leg: DraftLeg = { ...cand, alias: aliasFor(cand.label), status: 'checking' }
+    setLegs((prev) => [...prev, leg])
+
+    const labelMeta = schema?.labels.find((l) => l.name === cand.label)
+    setFields((prev) => [
+      ...prev,
+      ...(labelMeta?.properties ?? [])
+        .filter((prop) => !SKIP_KINDS.includes(prop.inferredKind))
+        .map((prop) => {
+          const suggested = suggestMetrics(prop.inferredKind)
+          return {
+            propertyName: prop.name,
+            legAlias: leg.alias,
+            enabled: false,
+            kind: prop.inferredKind,
+            metrics: suggested.map((m) => ({
+              metricId: m.id, params: { ...m.defaultParams }, threshold: m.defaultThreshold,
+            })),
+          }
+        }),
+    ])
+
+    const startLabel = cand.direction === 'out' ? selectedLabel!.name : cand.label
+    const endLabel = cand.direction === 'out' ? cand.label : selectedLabel!.name
+    let live = false
+    try {
+      live = await window.api.schema.validatePattern({ relType: cand.relType, startLabel, endLabel })
+    } catch {
+      live = false
+    }
+    setLegs((prev) => prev.map((l) => (l.alias === leg.alias ? { ...l, status: live ? 'live' : 'empty' } : l)))
+  }
+
+  function removeLeg(alias: string): void {
+    setLegs((prev) => prev.filter((l) => l.alias !== alias))
+    setFields((prev) => prev.filter((f) => f.legAlias !== alias))
+  }
+
+  function toggleField(key: string) {
+    setFields((prev) => prev.map((f) => fieldKey(f) === key ? { ...f, enabled: !f.enabled } : f))
   }
 
   function toggleMetric(fieldName: string, metricId: string) {
     setFields((prev) => prev.map((f) => {
-      if (f.propertyName !== fieldName) return f
+      if (fieldKey(f) !== fieldName) return f
       const hasIt = f.metrics.some((m) => m.metricId === metricId)
       if (hasIt) {
         return { ...f, metrics: f.metrics.filter((m) => m.metricId !== metricId) }
@@ -222,7 +319,7 @@ export default function ConfigureScreen() {
 
   function setMetricParam(fieldName: string, metricId: string, key: string, value: unknown) {
     setFields((prev) => prev.map((f) => {
-      if (f.propertyName !== fieldName) return f
+      if (fieldKey(f) !== fieldName) return f
       return {
         ...f,
         metrics: f.metrics.map((m) => m.metricId === metricId ? { ...m, params: { ...m.params, [key]: value } } : m),
@@ -232,7 +329,7 @@ export default function ConfigureScreen() {
 
   function setMetricThreshold(fieldName: string, metricId: string, threshold: number) {
     setFields((prev) => prev.map((f) => {
-      if (f.propertyName !== fieldName) return f
+      if (fieldKey(f) !== fieldName) return f
       return {
         ...f,
         metrics: f.metrics.map((m) => m.metricId === metricId ? { ...m, threshold } : m),
@@ -250,11 +347,11 @@ export default function ConfigureScreen() {
     // their relative sizes. Carrying stale weights forward is what let a session
     // end up with five fields at 1/9 each, whose total could never reach the
     // combined threshold.
-    const priorTotal = enabled.reduce((sum, f) => sum + (fieldSurfacing[f.propertyName]?.weight ?? 0), 0)
+    const priorTotal = enabled.reduce((sum, f) => sum + (fieldSurfacing[fieldKey(f)]?.weight ?? 0), 0)
     const sf: Record<string, { threshold: number; weight: number }> = {}
     for (const f of enabled) {
-      const cfg = fieldSurfacing[f.propertyName]
-      sf[f.propertyName] = {
+      const cfg = fieldSurfacing[fieldKey(f)]
+      sf[fieldKey(f)] = {
         threshold: cfg?.threshold ?? 0.8,
         weight: cfg && priorTotal > 0 ? cfg.weight / priorTotal : 1 / enabled.length,
       }
@@ -286,13 +383,15 @@ export default function ConfigureScreen() {
     const enabledFields = fields.filter((f) => f.enabled && f.metrics.length > 0)
     const fieldConfigs: FieldConfig[] = enabledFields.map((f) => ({
       propertyName: f.propertyName,
+      legAlias: f.legAlias,
       metrics: f.metrics as MetricConfig[],
     }))
 
     const sfFields = enabledFields.map((f) => ({
       propertyName: f.propertyName,
-      threshold: fieldSurfacing[f.propertyName]?.threshold ?? 0.8,
-      weight: fieldSurfacing[f.propertyName]?.weight ?? (1 / enabledFields.length),
+      legAlias: f.legAlias,
+      threshold: fieldSurfacing[fieldKey(f)]?.threshold ?? 0.8,
+      weight: fieldSurfacing[fieldKey(f)]?.weight ?? (1 / enabledFields.length),
     }))
 
     const surfacingRule: SurfacingRule = {
@@ -309,6 +408,11 @@ export default function ConfigureScreen() {
       blockingStrategy: blocking,
       blockingField: blocking === 'prefix' ? blockingField || seekable[0]?.name : undefined,
       blockingPrefixLength: blocking === 'prefix' ? prefixLength : undefined,
+      // Only legs with data. A leg the schema offers but the graph has nothing
+      // for would contribute no scores and no error.
+      legs: legs.filter((l) => l.status === 'live').map(({ alias, relType, direction, label }) => ({
+        alias, relType, direction, label,
+      })),
       status: 'configuring' as const,
       reviewCursor: 0,
       reviewFilter: { verdict: 'all' as const },
@@ -552,6 +656,72 @@ export default function ConfigureScreen() {
               </div>
             )}
 
+            {/* Related nodes. Fields from one hop away join the same rule; only
+                the primary label ever merges. */}
+            <div className="bg-gray-900 rounded-xl border border-gray-800 px-5 py-4 space-y-3">
+              <div>
+                <p className="text-sm font-medium text-white">Related nodes</p>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  Compare on properties one hop away as well — an address, a ticker, a parent
+                  company. Only {selectedLabel.name} nodes are ever merged; related nodes supply
+                  values to compare and nothing else.
+                </p>
+              </div>
+
+              {legs.map((leg) => (
+                <div key={leg.alias} className="flex items-center gap-2 text-xs bg-gray-950 border border-gray-800 rounded-lg px-3 py-2">
+                  <span className="font-mono text-gray-300">
+                    ({selectedLabel.name}){leg.direction === 'out' ? '-' : '<-'}[:{leg.relType}]{leg.direction === 'out' ? '->' : '-'}({leg.label})
+                  </span>
+                  <span className="text-gray-600">as</span>
+                  <span className="text-sky-300">{leg.alias}</span>
+                  {leg.status === 'checking' && <span className="text-gray-500">checking…</span>}
+                  {leg.status === 'live' && <span className="text-emerald-400">✓ has data</span>}
+                  {leg.status === 'empty' && (
+                    <span className="text-amber-400" title="The schema reports this shape but no nodes are connected this way, so it would contribute nothing">
+                      ⚠ no data — will be ignored
+                    </span>
+                  )}
+                  <div className="flex-1" />
+                  <button onClick={() => removeLeg(leg.alias)} className="text-gray-500 hover:text-gray-300">remove</button>
+                </div>
+              ))}
+
+              {/* Multi-labelled nodes make one relationship look like several
+                  legs: on a test database PREVIOUSLY_NAMED->Company and
+                  PREVIOUSLY_NAMED->PreviousName are the same 647,358 edges,
+                  because every PreviousName node is also a Company. Selecting
+                  both counts one piece of evidence twice, which matters most
+                  under a weighted average. */}
+              {legs.some((a, i) => legs.some((b, j) => i < j && a.relType === b.relType && a.direction === b.direction)) && (
+                <p className="text-xs text-amber-400">
+                  ⚠ Two legs use the same relationship in the same direction. If the labels overlap —
+                  nodes carrying both — these reach the same nodes, and their fields would count the
+                  same evidence twice.
+                </p>
+              )}
+
+              {availableLegs.length > 0 ? (
+                <div className="flex flex-wrap gap-1.5">
+                  {availableLegs.map((cand) => (
+                    <button
+                      key={`${cand.relType}|${cand.direction}|${cand.label}`}
+                      onClick={() => addLeg(cand)}
+                      className="text-xs font-mono px-2 py-1 rounded border border-gray-700 text-gray-400 hover:text-white hover:border-gray-500"
+                    >
+                      + {cand.direction === 'out' ? '' : '←'}{cand.relType} ({cand.label})
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-xs text-gray-600">
+                  {legs.length > 0
+                    ? 'No further relationships available from this label.'
+                    : 'The schema reports no relationships from this label.'}
+                </p>
+              )}
+            </div>
+
             {fields.length === 0 && (
               <div className="bg-gray-900 rounded-xl border border-gray-800 px-6 py-8 text-center space-y-2">
                 <p className="text-white font-medium">No comparable properties found</p>
@@ -564,22 +734,31 @@ export default function ConfigureScreen() {
             )}
 
             {fields.map((field) => {
-              const propMeta = selectedLabel.properties.find((p) => p.name === field.propertyName)
+              // A related field's property metadata lives on its own label.
+              const ownerLabel = field.legAlias
+                ? schema?.labels.find((l) => l.name === legs.find((g) => g.alias === field.legAlias)?.label)
+                : selectedLabel
+              const propMeta = ownerLabel?.properties.find((p) => p.name === field.propertyName)
               // For properties whose kind couldn't be determined, fall back to name-applicable metrics
               const applicableMetrics = METRICS.filter((m) =>
                 m.applicableTo.includes((field.kind === 'other' ? 'name' : field.kind) as never)
               )
               return (
-                <div key={field.propertyName} className={`bg-gray-900 rounded-xl border transition-colors ${field.enabled ? 'border-gray-700' : 'border-gray-800 opacity-60'}`}>
+                <div key={fieldKey(field)} className={`bg-gray-900 rounded-xl border transition-colors ${field.enabled ? 'border-gray-700' : 'border-gray-800 opacity-60'}`}>
                   <div className="flex items-center gap-3 px-5 py-4">
                     <input
                       type="checkbox"
                       checked={field.enabled}
-                      onChange={() => toggleField(field.propertyName)}
+                      onChange={() => toggleField(fieldKey(field))}
                       className="w-4 h-4 accent-emerald-500"
                     />
                     <div className="flex-1">
                       <div className="flex items-center gap-2">
+                        {field.legAlias && (
+                          <span className="text-xs px-1.5 py-0.5 bg-sky-950 border border-sky-800 rounded text-sky-300">
+                            {legs.find((g) => g.alias === field.legAlias)?.label ?? field.legAlias}
+                          </span>
+                        )}
                         <span className="font-medium text-white">{field.propertyName}</span>
                         <span className="text-xs px-1.5 py-0.5 bg-gray-800 rounded text-gray-400">{field.kind}</span>
                         {propMeta?.mandatory && (
