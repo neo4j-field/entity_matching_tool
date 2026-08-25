@@ -594,19 +594,20 @@ async function scoreAndSurface(
     `[compute] snapshots: ${snapshotMap.size} of ${involved.size} nodes in ${Date.now() - tSnap}ms`
   )
 
-  const fields =
-    fieldNodeIds ??
-    (() => {
-      const m = new Map<string, Set<string>>()
-      for (const fc of session.fields) {
-        const ids = new Set<string>()
-        for (const [id, snap] of snapshotMap) {
-          if (hasFieldValue(snap, fc)) ids.add(id)
-        }
-        m.set(fieldKey(fc), ids)
-      }
-      return m
-    })()
+  // Presence for every field. The caller's map covers only the fields that went
+  // through candidate generation, and a related field never does — so without
+  // filling those in here they would look uncomparable to every pair, be
+  // skipped by All mode, and never reject anything. They were scored and then
+  // ignored: 281 pairs surfaced under an All rule whose related field scored 0.
+  const fields = fieldNodeIds ?? new Map<string, Set<string>>()
+  for (const fc of session.fields) {
+    if (fields.has(fieldKey(fc))) continue
+    const ids = new Set<string>()
+    for (const [id, snap] of snapshotMap) {
+      if (hasFieldValue(snap, fc)) ids.add(id)
+    }
+    fields.set(fieldKey(fc), ids)
+  }
 
   const tDense = Date.now()
   const densified = densify(session, pairScores, snapshotMap)
@@ -1075,6 +1076,20 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
     })
     if (fetched.length < 2) return { count: 0, exact: true, candidates: 0 }
 
+    // Attach the legs to the sample. Without this a session with related fields
+    // estimates as though it had none: every related field would look absent,
+    // abstain, and drop out of the rule.
+    if (session.legs?.length) {
+      const byId = new Map(fetched.map((n) => [n.id, n]))
+      const tLegs = Date.now()
+      await loadSnapshots(neo4jSession, new Set(byId.keys()), byId, new AbortController().signal, session.legs)
+      // loadSnapshots replaces each map entry with a fresh object rather than
+      // mutating the one passed in, so the array still points at the leg-less
+      // originals until they are swapped back.
+      for (let i = 0; i < fetched.length; i++) fetched[i] = byId.get(fetched[i].id) ?? fetched[i]
+      console.log(`[estimate] legs attached to ${byId.size} sampled nodes in ${Date.now() - tLegs}ms`)
+    }
+
     console.log(`[estimate] ${session.label}: ${totalNodes} nodes, fetched ${fetched.length}`)
     let t = Date.now()
     const candidates = countCandidates(session, fetched)
@@ -1136,6 +1151,10 @@ function countCandidates(session: Session, nodes: NodeSnapshot[]): number {
   let widest = 0
 
   for (const fieldConfig of session.fields) {
+    // Related fields produce no candidates — they are scored per pair against
+    // the pairs the primary label generated — so counting them here would
+    // report a candidate set compute never builds.
+    if (fieldConfig.legAlias) continue
     const present = nodes.filter((n) => n.properties[fieldConfig.propertyName] !== undefined)
     if (present.length < 2) continue
 
@@ -1176,9 +1195,12 @@ async function surfacedCount(session: Session, nodes: NodeSnapshot[]): Promise<n
   const signal = new AbortController().signal
 
   for (const fieldConfig of session.fields) {
-    const present = nodes.filter((n) => n.properties[fieldConfig.propertyName] !== undefined)
+    const present = nodes.filter((n) => hasFieldValue(n, fieldConfig))
     fieldNodeIds.set(fieldKey(fieldConfig), new Set(present.map((n) => n.id)))
     if (present.length < 2) continue
+    // Mirrors the real run: a related field never reaches computePairScores,
+    // and densify() below scores it per pair.
+    if (fieldConfig.legAlias) continue
 
     const records: NodeRecord[] = present.map((n) => ({
       id: n.id,

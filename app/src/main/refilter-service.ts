@@ -2,7 +2,7 @@ import { getDb } from './db'
 import { getDriver } from './connection-service'
 import { applySurfacingRule, loadSnapshots } from './metric-runner'
 import { fieldKey } from '../shared/field-key'
-import type { MetricScore, NodeSnapshot, RefilterResult, Session } from '../shared/types'
+import type { MetricScore, NodeSnapshot, PatternLeg, RefilterResult, Session } from '../shared/types'
 
 /**
  * Re-apply the surfacing rule to candidates already captured.
@@ -128,7 +128,7 @@ export async function refilterPairs(session: Session, signal?: AbortSignal): Pro
 
   if (toHydrate.length > 0) {
     const t = Date.now()
-    await hydrate(toHydrate, signal)
+    await hydrate(toHydrate, session.legs ?? [], signal)
     console.log(`[refilter] hydrated ${toHydrate.length} pairs in ${Date.now() - t}ms`)
   }
   return result
@@ -146,6 +146,7 @@ function hasLegacyTemporal(nodeAJson: string, nodeBJson: string): boolean {
 // per pass on Company against 12 MB for ids and scores alone.
 async function hydrate(
   pairs: { pairId: string; idA: string; idB: string }[],
+  legs: PatternLeg[],
   signal?: AbortSignal
 ): Promise<void> {
   const driver = getDriver()
@@ -154,7 +155,9 @@ async function hydrate(
     const ids = new Set<string>()
     for (const p of pairs) { ids.add(p.idA); ids.add(p.idB) }
     const snapshots = new Map<string, NodeSnapshot>()
-    await loadSnapshots(neo4jSession, ids, snapshots, signal ?? new AbortController().signal)
+    // With the legs, so a promoted pair arrives carrying the related values the
+    // review panel shows and the export writes — not just its own properties.
+    await loadSnapshots(neo4jSession, ids, snapshots, signal ?? new AbortController().signal, legs)
 
     const db = getDb()
     const update = db.prepare('UPDATE pairs SET node_a_json = ?, node_b_json = ? WHERE id = ?')
