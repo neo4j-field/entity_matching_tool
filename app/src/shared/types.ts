@@ -223,9 +223,19 @@ export interface Session {
 
 // ─── Pairs ────────────────────────────────────────────────────────────────────
 
+export interface RelatedNode {
+  id: string
+  properties: Record<string, unknown>
+}
+
 export interface NodeSnapshot {
   id: string
   properties: Record<string, unknown>
+  // Nodes one hop away, by leg alias. Only present for sessions with legs, and
+  // only for pairs that surfaced — an unsurfaced candidate stores no snapshot
+  // at all. Carrying ids rather than bare values is what lets a pair exclude
+  // each node from the other's related set at comparison time.
+  related?: Record<string, RelatedNode[]>
 }
 
 export interface MetricScore {

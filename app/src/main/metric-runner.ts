@@ -17,11 +17,19 @@ import type {
   PairEstimate,
   CandidateSummary,
   CaptureState,
+  NodeSnapshot,
+  PatternLeg,
+  RelatedNode,
 } from '../shared/types'
 import type { NodeRecord } from './metrics/types'
 
 // Element ids per snapshot re-fetch. The plan is a NodeByElementIdSeek, so this
 // is only about bounding one response.
+// Related nodes kept per primary node, per leg. Scoring compares every
+// combination, so this bounds a single pair's cost the way MAX_LIST_VALUES
+// bounds a list-valued property's.
+const MAX_RELATED_PER_NODE = 10
+
 const SNAPSHOT_BATCH_SIZE = 10_000
 
 export type ProgressEvent = {
@@ -86,6 +94,13 @@ export async function runMetrics(
         // Signal that this metric has started so the UI shows it at 0% immediately
         onProgress({ metricId: metricConfig.metricId, fieldName: fieldKey(fieldConfig), pct: 0, pairsAbove: 0 })
       }
+
+      // A related field never generates candidates. Bucketing on one would make
+      // two nodes candidates because they share a related node, which is the
+      // grouping this design rules out — fifty companies at one registered
+      // address are not fifty duplicates. densify() scores these per pair,
+      // against the pairs the primary label produced.
+      if (fieldConfig.legAlias) continue
 
       // Id and the one value this field needs, nothing else.
       //
@@ -465,7 +480,7 @@ async function capturePrefix(
       // Only the nodes in this batch's pairs, so memory tracks the batch.
       const involved = new Set<string>()
       for (const { idA, idB } of batchScores.values()) { involved.add(idA); involved.add(idB) }
-      await loadSnapshots(neo4jSession, involved, snapshotMap, signal)
+      await loadSnapshots(neo4jSession, involved, snapshotMap, signal, session.legs ?? [])
       densify(session, batchScores, snapshotMap)
 
       const fields = fieldPresence(session, snapshotMap)
@@ -529,6 +544,15 @@ async function capturePrefix(
 }
 
 /** Which nodes carry each configured field, read from their snapshots. */
+// Whether a node carries anything comparable for a field: its own property, or
+// at least one related node with that property. Presence is per node; whether a
+// *pair* can be compared is decided in densify(), which also removes each node
+// from the other's related set.
+function hasFieldValue(snap: NodeSnapshot, fc: { propertyName: string; legAlias?: string }): boolean {
+  if (!fc.legAlias) return snap.properties[fc.propertyName] !== undefined
+  return (snap.related?.[fc.legAlias] ?? []).some((r) => r.properties[fc.propertyName] !== undefined)
+}
+
 function fieldPresence(
   session: Session,
   snapshots: Map<string, NodeSnapshot>
@@ -537,7 +561,7 @@ function fieldPresence(
   for (const fc of session.fields) {
     const ids = new Set<string>()
     for (const [id, snap] of snapshots) {
-      if (snap.properties[fc.propertyName] !== undefined) ids.add(id)
+      if (hasFieldValue(snap, fc)) ids.add(id)
     }
     m.set(fieldKey(fc), ids)
   }
@@ -565,7 +589,7 @@ async function scoreAndSurface(
   const involved = new Set<string>()
   for (const { idA, idB } of pairScores.values()) { involved.add(idA); involved.add(idB) }
   const tSnap = Date.now()
-  await loadSnapshots(neo4jSession, involved, snapshotMap, signal ?? new AbortController().signal)
+  await loadSnapshots(neo4jSession, involved, snapshotMap, signal ?? new AbortController().signal, session.legs ?? [])
   console.log(
     `[compute] snapshots: ${snapshotMap.size} of ${involved.size} nodes in ${Date.now() - tSnap}ms`
   )
@@ -577,7 +601,7 @@ async function scoreAndSurface(
       for (const fc of session.fields) {
         const ids = new Set<string>()
         for (const [id, snap] of snapshotMap) {
-          if (snap.properties[fc.propertyName] !== undefined) ids.add(id)
+          if (hasFieldValue(snap, fc)) ids.add(id)
         }
         m.set(fieldKey(fc), ids)
       }
@@ -629,7 +653,8 @@ export async function loadSnapshots(
   neo4jSession: ReturnType<ReturnType<typeof getDriver>['session']>,
   ids: Set<string>,
   into: Map<string, NodeSnapshot>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  legs: PatternLeg[] = []
 ): Promise<void> {
   const all = [...ids]
   for (let i = 0; i < all.length; i += SNAPSHOT_BATCH_SIZE) {
@@ -645,6 +670,47 @@ export async function loadSnapshots(
       for (const [k, v] of Object.entries(raw)) properties[k] = sanitize(v)
       into.set(r.get('id') as string, { id: r.get('id') as string, properties })
     }
+    for (const leg of legs) {
+      if (signal.aborted) return
+      await loadLeg(neo4jSession, batch, leg, into)
+    }
+  }
+}
+
+/**
+ * Attach one leg's related nodes to the snapshots of a batch of primary nodes.
+ *
+ * Capped per node, for the same reason MAX_LIST_VALUES caps a list-valued
+ * property: scoring compares every combination, so an unbounded fan-out would
+ * cost |a| x |b| comparisons on a single pair.
+ */
+async function loadLeg(
+  neo4jSession: ReturnType<ReturnType<typeof getDriver>['session']>,
+  batch: string[],
+  leg: PatternLeg,
+  into: Map<string, NodeSnapshot>
+): Promise<void> {
+  const arrow = leg.direction === 'out' ? '-[:`REL`]->' : '<-[:`REL`]-'
+  const pattern = arrow.replace('REL', leg.relType)
+  const result = await neo4jSession.run(
+    `MATCH (n) WHERE elementId(n) IN $ids
+     MATCH (n)${pattern}(m:\`${leg.label}\`)
+     WITH n, m LIMIT $cap
+     RETURN elementId(n) AS id,
+            collect({ id: elementId(m), props: properties(m) })[..${MAX_RELATED_PER_NODE}] AS related`,
+    { ids: batch, cap: int(batch.length * MAX_RELATED_PER_NODE) }
+  )
+  for (const r of result.records) {
+    const snap = into.get(r.get('id') as string)
+    if (!snap) continue
+    const nodes: RelatedNode[] = []
+    for (const entry of (r.get('related') ?? []) as { id: string; props: Record<string, unknown> }[]) {
+      const properties: Record<string, unknown> = {}
+      for (const [k, v] of Object.entries(entry.props ?? {})) properties[k] = sanitize(v)
+      nodes.push({ id: entry.id, properties })
+    }
+    if (!snap.related) snap.related = {}
+    snap.related[leg.alias] = nodes
   }
 }
 
@@ -777,7 +843,9 @@ function computeDistributions(
 
 type PairEntry = { idA: string; idB: string; scores: MetricScore[]; abstained?: Set<string> }
 type PairScoreMap = Map<string, PairEntry>
-type NodeSnapshot = { id: string; properties: Record<string, unknown> }
+// NodeSnapshot was declared here as a local structural duplicate of the shared
+// type. It matched by accident rather than by definition, so a field added to
+// the real one — `related` — was invisible to every use in this file.
 
 // Fills in the scores candidate generation never produced, for every field the
 // two nodes both carry. Returns how many it added.
@@ -790,18 +858,31 @@ function densify(session: Session, pairScores: PairScoreMap, snapshots: Map<stri
   let densified = 0
   for (const entry of pairScores.values()) {
     const { idA, idB, scores } = entry
-    const propsA = snapshots.get(idA)?.properties
-    const propsB = snapshots.get(idB)?.properties
-    if (!propsA || !propsB) continue
+    const snapA = snapshots.get(idA)
+    const snapB = snapshots.get(idB)
+    if (!snapA || !snapB) continue
+    const propsA = snapA.properties
+    const propsB = snapB.properties
     const have = new Set(scores.map((s) => `${s.fieldName}|${s.metricId}`))
     const scoredFields = new Set(scores.map((s) => s.fieldName))
 
     for (const fieldConfig of session.fields) {
+      // A related field's value is the list its leg reaches, which is where
+      // every related score is produced: candidate generation never sees these
+      // fields, because bucketing on them would make two nodes candidates for
+      // sharing a related node — the grouping this design rules out.
+      const a = fieldConfig.legAlias
+        ? relatedValues(snapA, fieldConfig.legAlias, fieldConfig.propertyName, idB)
+        : propsA[fieldConfig.propertyName]
+      const b = fieldConfig.legAlias
+        ? relatedValues(snapB, fieldConfig.legAlias, fieldConfig.propertyName, idA)
+        : propsB[fieldConfig.propertyName]
       // properties() omits nulls, so absence here means the node genuinely
-      // lacks the property and there is nothing to compare.
-      const a = propsA[fieldConfig.propertyName]
-      const b = propsB[fieldConfig.propertyName]
+      // lacks the property and there is nothing to compare. An empty related
+      // list means the same: a comparison that was never possible.
       if (a === undefined || b === undefined) continue
+      if (Array.isArray(a) && a.length === 0) continue
+      if (Array.isArray(b) && b.length === 0) continue
 
       for (const metricConfig of fieldConfig.metrics) {
         if (have.has(`${fieldKey(fieldConfig)}|${metricConfig.metricId}`)) continue
@@ -826,6 +907,34 @@ function densify(session: Session, pairScores: PairScoreMap, snapshots: Map<stri
     }
   }
   return densified
+}
+
+/**
+ * One leg's values for a node, with the pair's counterpart removed.
+ *
+ * If A's related set contains B, comparing the two on that leg is circular —
+ * the pair scores well because it is linked, not because the two are
+ * independently alike. The exclusion has to happen here rather than at fetch
+ * time: a node's related set is loaded once and reused across every pair it
+ * appears in, so who to exclude is only known per pair.
+ *
+ * Two nodes both linked to some third node is different, and stays: that is
+ * ordinary shared evidence.
+ */
+function relatedValues(
+  snap: NodeSnapshot,
+  alias: string,
+  propertyName: string,
+  counterpartId: string
+): unknown[] {
+  const nodes = snap.related?.[alias] ?? []
+  const out: unknown[] = []
+  for (const rel of nodes) {
+    if (rel.id === counterpartId) continue
+    const v = rel.properties[propertyName]
+    if (v !== undefined) out.push(v)
+  }
+  return out
 }
 
 // Above this many candidate pairs the estimate thins the node set before scoring.
@@ -897,7 +1006,7 @@ async function estimatePrefixPass(
   const involved = new Set<string>()
   for (const { idA, idB } of batchScores.values()) { involved.add(idA); involved.add(idB) }
   const snapshots = new Map<string, NodeSnapshot>()
-  await loadSnapshots(neo4jSession, involved, snapshots, signal)
+  await loadSnapshots(neo4jSession, involved, snapshots, signal, session.legs ?? [])
   densify(session, batchScores, snapshots)
   const fields = fieldPresence(session, snapshots)
 

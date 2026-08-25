@@ -17,6 +17,7 @@ function rowToSession(row: Record<string, unknown>): Session {
       | 'blockingStrategy'
       | 'blockingField'
       | 'blockingPrefixLength'
+      | 'legs'
       | 'capture'
     >),
     status: row.status as Session['status'],
@@ -47,13 +48,13 @@ export function createSession(partial: Omit<Session, 'id' | 'createdAt' | 'updat
   const db = getDb()
   const id = randomUUID()
   const now = Date.now()
-  const { fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength, capture, ...rest } = partial
+  const { fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength, legs, capture, ...rest } = partial
   db.prepare(`
     INSERT INTO sessions(id, connection_id, label, config_json, status, review_cursor, review_filter, review_sort, merge_passes, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id, rest.connectionId, rest.label,
-    JSON.stringify({ fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength, capture }),
+    JSON.stringify({ fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength, legs, capture }),
     rest.status,
     rest.reviewCursor,
     JSON.stringify(rest.reviewFilter),
@@ -72,7 +73,7 @@ export function loadSession(id: string): Session | null {
 
 export function saveSession(session: Session): void {
   const db = getDb()
-  const { fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength, capture } = session
+  const { fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength, legs, capture } = session
   db.prepare(`
     UPDATE sessions SET
       config_json   = ?,
@@ -84,7 +85,7 @@ export function saveSession(session: Session): void {
       updated_at    = ?
     WHERE id = ?
   `).run(
-    JSON.stringify({ fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength, capture }),
+    JSON.stringify({ fields, surfacingRule, blockingStrategy, blockingField, blockingPrefixLength, legs, capture }),
     session.status,
     session.reviewCursor,
     JSON.stringify(session.reviewFilter),
