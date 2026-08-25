@@ -6,6 +6,12 @@ Schema discovery, similarity scoring, review, and merging work against any label
 
 Built with Electron, React, TypeScript, and Tailwind CSS.
 
+**Version 0.1 — initial release.** Everything described below is implemented and
+has been run against live Neo4j instances, including labels of several million
+nodes. Treat the figures quoted throughout as measurements rather than targets:
+they come from real runs, and the section they appear in says which database and
+which configuration produced them.
+
 ---
 
 ## What it does
