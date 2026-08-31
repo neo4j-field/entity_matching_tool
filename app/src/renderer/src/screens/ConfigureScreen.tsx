@@ -135,6 +135,9 @@ function RuleEditor({ node, options, onChange, onRemove, depth = 0 }: RuleEditor
             className="w-20 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200"
           />
           <div className="flex-1" />
+          {/* Same failure as an empty group: nothing to average is unjudgeable,
+              so the node can never be true. */}
+          {node.children.length === 0 && <span className="text-amber-400 text-xs">⚠ empty — nothing can satisfy this</span>}
           {onRemove && <button onClick={onRemove} className="text-gray-600 hover:text-gray-300 text-xs">×</button>}
         </div>
         {node.children.map((c, i) => (
