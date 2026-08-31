@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { getSettings } from './settings-service'
 import { fieldKey } from '../shared/field-key'
+import { describeRule, ruleTree } from '../shared/surfacing-tree'
 import { loadSession, listPairs } from './session-service'
 import { getCachedSchema } from './schema-service'
 import { recordCall, tokensFromUsage, emptyTokens } from './usage-service'
@@ -33,7 +34,7 @@ Session context:
 - Comparison fields: ${fields.map((f) => `${f.propertyName} (${labelMeta?.properties.find((p) => p.name === f.propertyName)?.types.join(', ') ?? 'String'})`).join(', ')}
 - Active metrics:
 ${metricLines}
-- Surfacing rule: ${surfacingRule.mode}
+- Surfacing rule: ${describeRule(ruleTree(surfacingRule))}
 - Pairs in queue: ${total} total, ${pending} pending, ${dup + distinct} decided (${dup} duplicate, ${distinct} distinct)`
 
   if (distributions) {

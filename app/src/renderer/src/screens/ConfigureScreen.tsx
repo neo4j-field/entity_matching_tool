@@ -1,6 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, type ReactElement } from 'react'
 import { useStore } from '../store'
 import { fieldKey } from '../../../shared/field-key'
+import { describeRule, ruleTree } from '../../../shared/surfacing-tree'
 import { METRICS, suggestMetrics, getMetricDef } from '../lib/metrics'
 import { formatUsd, summarizeTokens } from '../lib/usage'
 import { MAX_CANDIDATE_PAIRS } from '../../../shared/constants'
@@ -12,6 +13,7 @@ import type {
   LlmCallRecord,
   PropertyKind,
   PatternLeg,
+  RuleNode,
   PairEstimate,
   BlockingStrategy,
 } from '../../../shared/types'
@@ -68,13 +70,170 @@ function roundSampled(n: number, observed: number | undefined): string {
   return (Math.round(n / mag) * mag).toLocaleString()
 }
 
+
+// ── Rule editor ───────────────────────────────────────────────────────────────
+
+interface RuleEditorProps {
+  node: RuleNode
+  options: { key: string; propertyName: string; legAlias?: string }[]
+  onChange: (next: RuleNode) => void
+  onRemove?: () => void
+  depth?: number
+}
+
+function newLeaf(options: RuleEditorProps['options']): RuleNode {
+  const first = options[0]
+  return {
+    kind: 'field',
+    propertyName: first?.propertyName ?? '',
+    legAlias: first?.legAlias,
+    threshold: 0.85,
+  }
+}
+
+function RuleEditor({ node, options, onChange, onRemove, depth = 0 }: RuleEditorProps): ReactElement {
+  if (node.kind === 'field') {
+    const known = options.some((o) => o.key === fieldKey(node))
+    return (
+      <div className="flex items-center gap-2 py-1">
+        <select
+          value={fieldKey(node)}
+          onChange={(e) => {
+            const opt = options.find((o) => o.key === e.target.value)
+            if (opt) onChange({ ...node, propertyName: opt.propertyName, legAlias: opt.legAlias })
+          }}
+          className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200"
+        >
+          {!known && <option value={fieldKey(node)}>{fieldKey(node)} (not compared)</option>}
+          {options.map((o) => <option key={o.key} value={o.key}>{o.key}</option>)}
+        </select>
+        <span className="text-gray-500 text-xs">≥</span>
+        <input
+          type="number" min={0} max={1} step={0.01} value={node.threshold}
+          onChange={(e) => onChange({ ...node, threshold: Number(e.target.value) })}
+          className="w-20 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200"
+        />
+        {/* A leaf naming a field with no enabled metric never receives a score,
+            so it is unjudgeable for every pair and the rule silently surfaces
+            nothing. The rule editor and the field editor are separate screens,
+            which is what makes this easy to do by accident. */}
+        {!known && <span className="text-amber-400 text-xs">⚠ this field is not being compared</span>}
+        {onRemove && <button onClick={onRemove} className="text-gray-600 hover:text-gray-300 text-xs">×</button>}
+      </div>
+    )
+  }
+
+  if (node.kind === 'weighted') {
+    return (
+      <div className="border border-gray-800 rounded-lg px-3 py-2 space-y-1 bg-gray-950/50">
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-sky-300 font-medium">Weighted average</span>
+          <span className="text-gray-500">≥</span>
+          <input
+            type="number" min={0} max={1} step={0.01} value={node.threshold}
+            onChange={(e) => onChange({ ...node, threshold: Number(e.target.value) })}
+            className="w-20 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200"
+          />
+          <div className="flex-1" />
+          {onRemove && <button onClick={onRemove} className="text-gray-600 hover:text-gray-300 text-xs">×</button>}
+        </div>
+        {node.children.map((c, i) => (
+          <div key={`${fieldKey(c)}-${i}`} className="flex items-center gap-2 pl-3 py-0.5">
+            <span className="text-xs text-gray-300 font-mono">{fieldKey(c)}</span>
+            <span className="text-gray-600 text-xs">weight</span>
+            <input
+              type="number" min={0} step={0.05} value={c.weight}
+              onChange={(e) => {
+                const children = [...node.children]
+                children[i] = { ...c, weight: Number(e.target.value) }
+                onChange({ ...node, children })
+              }}
+              className="w-20 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200"
+            />
+            <button
+              onClick={() => onChange({ ...node, children: node.children.filter((_, j) => j !== i) })}
+              className="text-gray-600 hover:text-gray-300 text-xs"
+            >×</button>
+          </div>
+        ))}
+        <button
+          onClick={() => {
+            const first = options[0]
+            if (!first) return
+            onChange({ ...node, children: [...node.children, { propertyName: first.propertyName, legAlias: first.legAlias, weight: 0.5 }] })
+          }}
+          className="text-xs text-gray-500 hover:text-gray-300 pl-3"
+        >+ field</button>
+      </div>
+    )
+  }
+
+  const setChild = (i: number, next: RuleNode): void => {
+    const children = [...node.children]
+    children[i] = next
+    onChange({ ...node, children })
+  }
+
+  return (
+    <div className={`rounded-lg border px-3 py-2 space-y-1 ${depth % 2 === 0 ? 'border-gray-800 bg-gray-950/40' : 'border-gray-700 bg-gray-900/40'}`}>
+      <div className="flex items-center gap-2">
+        <div className="flex rounded overflow-hidden border border-gray-700">
+          {(['and', 'or'] as const).map((op) => (
+            <button
+              key={op}
+              onClick={() => onChange({ ...node, op })}
+              className={`px-2 py-0.5 text-xs ${node.op === op ? 'bg-emerald-900 text-emerald-300' : 'bg-gray-900 text-gray-500 hover:text-gray-300'}`}
+            >
+              {op === 'and' ? 'ALL of' : 'ANY of'}
+            </button>
+          ))}
+        </div>
+        <div className="flex-1" />
+        {/* A group with nothing in it is unjudgeable, so it can never be true. */}
+        {node.children.length === 0 && <span className="text-amber-400 text-xs">⚠ empty — nothing can satisfy this</span>}
+        {onRemove && <button onClick={onRemove} className="text-gray-600 hover:text-gray-300 text-xs">×</button>}
+      </div>
+
+      <div className="pl-3 space-y-1">
+        {node.children.map((child, i) => (
+          <RuleEditor
+            key={i}
+            node={child}
+            options={options}
+            depth={depth + 1}
+            onChange={(next) => setChild(i, next)}
+            onRemove={() => onChange({ ...node, children: node.children.filter((_, j) => j !== i) })}
+          />
+        ))}
+        <div className="flex gap-2 pt-0.5">
+          <button
+            onClick={() => onChange({ ...node, children: [...node.children, newLeaf(options)] })}
+            className="text-xs text-gray-500 hover:text-gray-300"
+          >+ field</button>
+          <button
+            onClick={() => onChange({ ...node, children: [...node.children, { kind: 'group', op: 'and', children: [] }] })}
+            className="text-xs text-gray-500 hover:text-gray-300"
+          >+ group</button>
+          <button
+            onClick={() => onChange({ ...node, children: [...node.children, { kind: 'weighted', threshold: 0.85, children: [] }] })}
+            className="text-xs text-gray-500 hover:text-gray-300"
+          >+ weighted average</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function ConfigureScreen() {
   const { schema, connection, session, settings, setSession, setScreen, setPairs, setDistributions, addToast } = useStore()
   const [step, setStep] = useState<Step>('label')
   const [selectedLabel, setSelectedLabel] = useState<LabelMeta | null>(null)
   const [fields, setFields] = useState<DraftField[]>([])
   const [legs, setLegs] = useState<DraftLeg[]>([])
-  const [surfacingMode, setSurfacingMode] = useState<'any' | 'all' | 'weighted-average'>('any')
+  const [surfacingMode, setSurfacingMode] = useState<'any' | 'all' | 'weighted-average' | 'custom'>('any')
+  // Only set in 'custom'. The three named modes stay as they were, and are what
+  // a session stores unless someone builds an expression.
+  const [ruleNode, setRuleNode] = useState<RuleNode | null>(null)
   const [fieldSurfacing, setFieldSurfacing] = useState<Record<string, { threshold: number; weight: number }>>({})
   const [combinedThreshold, setCombinedThreshold] = useState(0.85)
   const [blocking, setBlocking] = useState<BlockingStrategy>('auto')
@@ -198,7 +357,12 @@ export default function ConfigureScreen() {
     setBlocking(session!.blockingStrategy ?? 'auto')
     setBlockingField(session!.blockingField ?? '')
     setPrefixLength(session!.blockingPrefixLength ?? 8)
-    setSurfacingMode(session!.surfacingRule.mode)
+    if (session!.surfacingRule.tree) {
+      setRuleNode(session!.surfacingRule.tree)
+      setSurfacingMode('custom')
+    } else {
+      setSurfacingMode(session!.surfacingRule.mode)
+    }
     if (session!.surfacingRule.combinedThreshold != null) {
       setCombinedThreshold(session!.surfacingRule.combinedThreshold)
     }
@@ -395,9 +559,12 @@ export default function ConfigureScreen() {
     }))
 
     const surfacingRule: SurfacingRule = {
-      mode: surfacingMode,
+      // mode and fields stay populated even for a custom rule: they are what an
+      // older build, and ruleTree(), fall back to when no tree is present.
+      mode: surfacingMode === 'custom' ? 'all' : surfacingMode,
       fields: sfFields,
       combinedThreshold: surfacingMode === 'weighted-average' ? combinedThreshold : undefined,
+      tree: surfacingMode === 'custom' && ruleNode ? ruleNode : undefined,
     }
 
     return {
@@ -913,22 +1080,64 @@ export default function ConfigureScreen() {
 
             {/* Mode selector */}
             <div className="flex gap-2">
-              {(['any', 'all', 'weighted-average'] as const).map((mode) => (
+              {(['any', 'all', 'weighted-average', 'custom'] as const).map((mode) => (
                 <button
                   key={mode}
-                  onClick={() => setSurfacingMode(mode)}
+                  onClick={() => {
+                    // Seed the expression from the mode on screen, so switching
+                    // to Custom starts from the rule you already had rather than
+                    // from nothing. The three modes are exact special cases.
+                    if (mode === 'custom' && !ruleNode) {
+                      setRuleNode(ruleTree({
+                        mode: surfacingMode === 'custom' ? 'all' : surfacingMode,
+                        fields: fields
+                          .filter((f) => f.enabled && f.metrics.length > 0)
+                          .map((f) => ({
+                            propertyName: f.propertyName,
+                            legAlias: f.legAlias,
+                            threshold: fieldSurfacing[fieldKey(f)]?.threshold ?? 0.8,
+                            weight: fieldSurfacing[fieldKey(f)]?.weight ?? 0.5,
+                          })),
+                        combinedThreshold,
+                      }))
+                    }
+                    setSurfacingMode(mode)
+                  }}
                   className={`px-4 py-2 rounded-lg text-sm font-medium border transition-colors ${
                     surfacingMode === mode
                       ? 'bg-emerald-900 border-emerald-700 text-emerald-300'
                       : 'bg-gray-900 border-gray-700 text-gray-400 hover:border-gray-600'
                   }`}
                 >
-                  {mode === 'any' ? 'Any field' : mode === 'all' ? 'All fields' : 'Weighted average'}
+                  {mode === 'any' ? 'Any field'
+                    : mode === 'all' ? 'All fields'
+                    : mode === 'weighted-average' ? 'Weighted average'
+                    : 'Custom rule'}
                 </button>
               ))}
             </div>
 
-            <div className="text-xs text-gray-500 space-y-1.5">
+            {surfacingMode === 'custom' && ruleNode && (
+              <div className="space-y-2">
+                <RuleEditor
+                  node={ruleNode}
+                  options={fields
+                    .filter((f) => f.enabled && f.metrics.length > 0)
+                    .map((f) => ({ key: fieldKey(f), propertyName: f.propertyName, legAlias: f.legAlias }))}
+                  onChange={setRuleNode}
+                />
+                <p className="text-xs text-gray-500 font-mono bg-gray-950 border border-gray-800 rounded px-3 py-2">
+                  {describeRule(ruleNode)}
+                </p>
+                <p className="text-xs text-gray-600">
+                  A field neither node carries cannot be judged, so it is left out and the group is
+                  decided on the rest — a group with nothing judged surfaces nothing. This is what
+                  All fields already does; the expression just makes it explicit.
+                </p>
+              </div>
+            )}
+
+            <div className={`text-xs text-gray-500 space-y-1.5 ${surfacingMode === 'custom' ? 'hidden' : ''}`}>
               <p>
                 A field&apos;s score is its{' '}
                 <span className="text-gray-300">best-scoring metric</span> — if any one metric you
@@ -985,8 +1194,9 @@ export default function ConfigureScreen() {
               )}
             </div>
 
-            {/* Per-field thresholds / weights */}
-            <div className="space-y-3">
+            {/* Per-field thresholds / weights. A custom rule carries its own
+                thresholds on each leaf, so these would be editable and ignored. */}
+            <div className={`space-y-3 ${surfacingMode === 'custom' ? 'hidden' : ''}`}>
               {Object.entries(fieldSurfacing).map(([name, cfg]) => (
                 <div key={name} className="bg-gray-900 rounded-xl border border-gray-800 px-5 py-4">
                   <div className="flex items-center gap-4">
