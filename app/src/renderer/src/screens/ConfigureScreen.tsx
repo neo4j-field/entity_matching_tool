@@ -1,7 +1,7 @@
 import { useState, useEffect, type ReactElement } from 'react'
 import { useStore } from '../store'
 import { fieldKey } from '../../../shared/field-key'
-import { describeRule, ruleTree } from '../../../shared/surfacing-tree'
+import { describeRule, ruleFieldKeys, ruleTree } from '../../../shared/surfacing-tree'
 import { METRICS, suggestMetrics, getMetricDef } from '../lib/metrics'
 import { formatUsd, summarizeTokens } from '../lib/usage'
 import { MAX_CANDIDATE_PAIRS } from '../../../shared/constants'
@@ -1137,6 +1137,30 @@ export default function ConfigureScreen() {
                   decided on the rest — a group with nothing judged surfaces nothing. This is what
                   All fields already does; the expression just makes it explicit.
                 </p>
+                {/* Under the named modes every enabled field was in the rule, so
+                    these could not diverge. They can now, and an unreferenced
+                    field is not inert: candidate generation is the union across
+                    every enabled field. Measured on a 244-node label, adding one
+                    unreferenced field took the candidate set from 5,744 to
+                    28,817 and surfaced one extra pair — a pair that became a
+                    candidate only through that field and then passed the rule. */}
+                {(() => {
+                  const used = new Set(ruleFieldKeys(ruleNode))
+                  const unused = fields
+                    .filter((f) => f.enabled && f.metrics.length > 0 && !used.has(fieldKey(f)))
+                    .map((f) => fieldKey(f))
+                  if (unused.length === 0) return null
+                  return (
+                    <p className="text-xs text-amber-400/90">
+                      ⚠ {unused.length} compared field{unused.length === 1 ? '' : 's'} not used by this
+                      rule: <span className="font-mono">{unused.join(', ')}</span>. They do not decide
+                      whether a pair surfaces, but they are still scored, still shown in review, and
+                      still widen the set of pairs considered — so they can bring in pairs the rule
+                      then accepts. Deselect them on{' '}
+                      <span className="text-gray-300">Fields &amp; Metrics</span> to narrow the search.
+                    </p>
+                  )
+                })()}
               </div>
             )}
 
