@@ -628,9 +628,14 @@ export default function ConfigureScreen() {
 
       const reasonMap: Record<string, string> = {}
       setFields((prev) => prev.map((f) => {
+        // The suggestion was made about the primary label's properties, so it
+        // must not reach a related field that happens to share a name — that
+        // would enable it and replace its metrics on advice about a different
+        // label.
+        if (f.legAlias) return f
         const s = suggestion.fields.find((sf) => sf.propertyName === f.propertyName)
         if (!s) return f
-        reasonMap[f.propertyName] = s.reason
+        reasonMap[fieldKey(f)] = s.reason
         return {
           ...f,
           enabled: s.enabled,
@@ -963,12 +968,12 @@ export default function ConfigureScreen() {
                         {propMeta?.mandatory && (
                           <span className="text-xs px-1.5 py-0.5 bg-amber-900 rounded text-amber-300">required</span>
                         )}
-                        {aiReasons[field.propertyName] && (
+                        {aiReasons[fieldKey(field)] && (
                           <span className="text-xs px-1.5 py-0.5 bg-indigo-950 border border-indigo-800 rounded text-indigo-400">✦ AI</span>
                         )}
                       </div>
-                      {aiReasons[field.propertyName] ? (
-                        <div className="text-xs text-indigo-400 mt-0.5">{aiReasons[field.propertyName]}</div>
+                      {aiReasons[fieldKey(field)] ? (
+                        <div className="text-xs text-indigo-400 mt-0.5">{aiReasons[fieldKey(field)]}</div>
                       ) : propMeta?.sampleValues && propMeta.sampleValues.length > 0 ? (
                         <div className="text-xs text-gray-600 mt-0.5 truncate">
                           e.g. {propMeta.sampleValues.slice(0, 3).map(String).join(', ')}
@@ -986,7 +991,7 @@ export default function ConfigureScreen() {
                           return (
                             <button
                               key={m.id}
-                              onClick={() => toggleMetric(field.propertyName, m.id)}
+                              onClick={() => toggleMetric(fieldKey(field), m.id)}
                               className={`px-3 py-1 rounded-full text-xs font-medium border transition-colors ${
                                 active
                                   ? 'bg-emerald-900 border-emerald-700 text-emerald-300'
@@ -1021,7 +1026,7 @@ export default function ConfigureScreen() {
                                   max={1}
                                   step={0.01}
                                   value={fm.threshold}
-                                  onChange={(e) => setMetricThreshold(field.propertyName, fm.metricId, parseFloat(e.target.value))}
+                                  onChange={(e) => setMetricThreshold(fieldKey(field), fm.metricId, parseFloat(e.target.value))}
                                   className="w-16 bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-xs text-white"
                                 />
                               </label>
@@ -1042,7 +1047,7 @@ export default function ConfigureScreen() {
                                     {pdef.type === 'select' ? (
                                       <select
                                         value={String(fm.params[pkey] ?? '')}
-                                        onChange={(e) => setMetricParam(field.propertyName, fm.metricId, pkey, e.target.value)}
+                                        onChange={(e) => setMetricParam(fieldKey(field), fm.metricId, pkey, e.target.value)}
                                         className="bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-xs text-white"
                                       >
                                         {pdef.options?.map((o) => <option key={o} value={o}>{o}</option>)}
@@ -1054,14 +1059,14 @@ export default function ConfigureScreen() {
                                         max={pdef.max}
                                         step={pdef.step}
                                         value={Number(fm.params[pkey] ?? 0)}
-                                        onChange={(e) => setMetricParam(field.propertyName, fm.metricId, pkey, parseFloat(e.target.value))}
+                                        onChange={(e) => setMetricParam(fieldKey(field), fm.metricId, pkey, parseFloat(e.target.value))}
                                         className="w-20 bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-xs text-white"
                                       />
                                     ) : (
                                       <input
                                         type="text"
                                         value={String(fm.params[pkey] ?? '')}
-                                        onChange={(e) => setMetricParam(field.propertyName, fm.metricId, pkey, e.target.value)}
+                                        onChange={(e) => setMetricParam(fieldKey(field), fm.metricId, pkey, e.target.value)}
                                         className="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-xs text-white"
                                       />
                                     )}
