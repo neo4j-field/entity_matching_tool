@@ -181,10 +181,33 @@ export interface CaptureState {
   fingerprint?: string
 }
 
+/**
+ * A surfacing rule as a boolean expression over fields.
+ *
+ * A `field` leaf is three-valued: it passes, fails, or cannot be judged at all
+ * when neither node carries the property. A `weighted` node holds leaves only —
+ * a mean needs numbers, and a group yields a verdict, so there is no score for
+ * `or(a, b)` to contribute to an average.
+ */
+export type RuleNode =
+  | { kind: 'field'; propertyName: string; legAlias?: string; threshold: number }
+  | { kind: 'group'; op: 'and' | 'or'; children: RuleNode[] }
+  | { kind: 'weighted'; threshold: number; children: WeightedLeaf[] }
+
+export interface WeightedLeaf {
+  propertyName: string
+  legAlias?: string
+  weight: number
+}
+
 export interface SurfacingRule {
+  // The three original modes. Retained because sessions on disk store them, and
+  // ruleTree() converts them exactly rather than rewriting anyone's data.
   mode: 'any' | 'all' | 'weighted-average'
   fields: FieldSurfacingConfig[]
   combinedThreshold?: number
+  // Authoritative when present.
+  tree?: RuleNode
 }
 
 export interface MergePassSummary {

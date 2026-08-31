@@ -1,4 +1,5 @@
 import { fieldKey } from '../shared/field-key'
+import { evaluateRule, ruleTree } from '../shared/surfacing-tree'
 import { createHash } from 'crypto'
 import { int } from 'neo4j-driver'
 import { getDriver } from './connection-service'
@@ -758,61 +759,16 @@ export function applySurfacingRule(
   session: Session,
   comparable: (fieldKeyOf: string) => boolean
 ): boolean {
-  const { mode, fields } = session.surfacingRule
-
   // Field score = max across metrics for that field
   const fieldScores = new Map<string, number>()
   for (const score of scores) {
     const current = fieldScores.get(score.fieldName) ?? 0
     fieldScores.set(score.fieldName, Math.max(current, score.score))
   }
-
-  if (mode === 'any') {
-    for (const fc of fields) {
-      const fs = fieldScores.get(fieldKey(fc)) ?? 0
-      if (fs >= fc.threshold) return true
-    }
-    return false
-  }
-
-  if (mode === 'all') {
-    // Every field the pair can actually be compared on must meet its threshold.
-    // Fields one or both nodes lack are skipped rather than counted as a
-    // failure — otherwise sparse data excludes pairs that match on everything
-    // they share. A field both nodes have but that produced no score is still a
-    // failure: that is a real comparison the pair lost.
-    let compared = 0
-    for (const fc of fields) {
-      if (!comparable(fieldKey(fc))) continue
-      compared++
-      if ((fieldScores.get(fieldKey(fc)) ?? 0) < fc.threshold) return false
-    }
-    return compared > 0
-  }
-
-  // weighted-average — divide by the weights actually in play so this is a mean
-  // rather than a sum. Weights drift away from summing to 1 whenever a field is
-  // removed or a slider is dragged, and an unnormalized sum silently rescales
-  // the combined threshold: five fields left holding 1/9 each cap the total at
-  // 0.56, so a 0.85 threshold can never be met however well the pair matches.
-  // A field that cannot be judged is dropped from both sides of the ratio, so it
-  // neither helps nor hurts. Leaving it only in the denominator would penalise a
-  // pair for a comparison nothing was willing to make.
-  //
-  // This now covers a field one of the nodes does not carry, which previously
-  // averaged in as a zero and so counted absent data as a mismatch. 'all' mode
-  // already skipped those for exactly the reason stated above, and the two modes
-  // disagreeing on what "cannot be judged" means is what made a re-filter unable
-  // to reproduce compute's own verdict.
-  const usable = fields.filter((fc) => comparable(fieldKey(fc)))
-  const totalWeight = usable.reduce((sum, fc) => sum + fc.weight, 0)
-  if (totalWeight <= 0) return false
-  const weighted = usable.reduce((sum, fc) => {
-    return sum + fc.weight * (fieldScores.get(fieldKey(fc)) ?? 0)
-  }, 0)
-  return weighted / totalWeight >= (session.surfacingRule.combinedThreshold ?? 0.85)
+  // Unjudgeable is not the same as false, so the walk returns three values and
+  // only TRUE surfaces a pair.
+  return evaluateRule(ruleTree(session.surfacingRule), fieldScores, comparable) === true
 }
-
 
 function percentile(sorted: number[], p: number): number {
   const idx = Math.ceil(p * sorted.length) - 1
