@@ -135,6 +135,8 @@ export interface FieldSurfacingConfig {
   legAlias?: string
   threshold: number
   weight: number
+  // Carried into the leaf this field becomes. See RuleNode.
+  required?: boolean
 }
 
 /**
@@ -190,7 +192,16 @@ export interface CaptureState {
  * `or(a, b)` to contribute to an average.
  */
 export type RuleNode =
-  | { kind: 'field'; propertyName: string; legAlias?: string; threshold: number }
+  | {
+      kind: 'field'
+      propertyName: string
+      legAlias?: string
+      threshold: number
+      // When set, a pair that cannot be judged on this field fails the leaf
+      // rather than having it ignored — "both records must carry this". Absent
+      // is the default and means unjudgeable, which a group skips.
+      required?: boolean
+    }
   | { kind: 'group'; op: 'and' | 'or'; children: RuleNode[] }
   | { kind: 'weighted'; threshold: number; children: WeightedLeaf[] }
 
@@ -198,6 +209,9 @@ export interface WeightedLeaf {
   propertyName: string
   legAlias?: string
   weight: number
+  // A required field neither node carries fails the whole weighted node, rather
+  // than being dropped from the average.
+  required?: boolean
 }
 
 export interface SurfacingRule {

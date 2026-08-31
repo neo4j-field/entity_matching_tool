@@ -117,6 +117,20 @@ function RuleEditor({ node, options, onChange, onRemove, depth = 0 }: RuleEditor
             so it is unjudgeable for every pair and the rule silently surfaces
             nothing. The rule editor and the field editor are separate screens,
             which is what makes this easy to do by accident. */}
+        {/* Without this a pair that cannot be judged on the field is ignored
+            here and decided on the rest of the group. With it, the pair fails —
+            "both records must carry this". */}
+        <button
+          onClick={() => onChange({ ...node, required: !node.required })}
+          title="Fail the pair when either record lacks this field, instead of ignoring the condition"
+          className={`text-xs px-1.5 py-0.5 rounded border ${
+            node.required
+              ? 'bg-sky-950 border-sky-700 text-sky-300'
+              : 'bg-gray-900 border-gray-700 text-gray-500 hover:text-gray-300'
+          }`}
+        >
+          both required
+        </button>
         {!known && <span className="text-amber-400 text-xs">⚠ this field is not being compared</span>}
         {onRemove && <button onClick={onRemove} className="text-gray-600 hover:text-gray-300 text-xs">×</button>}
       </div>
@@ -153,6 +167,21 @@ function RuleEditor({ node, options, onChange, onRemove, depth = 0 }: RuleEditor
               }}
               className="w-20 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200"
             />
+            <button
+              onClick={() => {
+                const children = [...node.children]
+                children[i] = { ...c, required: !c.required }
+                onChange({ ...node, children })
+              }}
+              title="Fail the whole weighted average when either record lacks this field"
+              className={`text-xs px-1.5 py-0.5 rounded border ${
+                c.required
+                  ? 'bg-sky-950 border-sky-700 text-sky-300'
+                  : 'bg-gray-900 border-gray-700 text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              both required
+            </button>
             <button
               onClick={() => onChange({ ...node, children: node.children.filter((_, j) => j !== i) })}
               className="text-gray-600 hover:text-gray-300 text-xs"
@@ -237,7 +266,9 @@ export default function ConfigureScreen() {
   // Only set in 'custom'. The three named modes stay as they were, and are what
   // a session stores unless someone builds an expression.
   const [ruleNode, setRuleNode] = useState<RuleNode | null>(null)
-  const [fieldSurfacing, setFieldSurfacing] = useState<Record<string, { threshold: number; weight: number }>>({})
+  const [fieldSurfacing, setFieldSurfacing] = useState<
+    Record<string, { threshold: number; weight: number; required?: boolean }>
+  >({})
   const [combinedThreshold, setCombinedThreshold] = useState(0.85)
   const [blocking, setBlocking] = useState<BlockingStrategy>('auto')
   const [blockingField, setBlockingField] = useState<string>('')
@@ -374,9 +405,9 @@ export default function ConfigureScreen() {
     }
     setFields(draft)
 
-    const sf: Record<string, { threshold: number; weight: number }> = {}
+    const sf: Record<string, { threshold: number; weight: number; required?: boolean }> = {}
     for (const f of session!.surfacingRule.fields) {
-      sf[fieldKey(f)] = { threshold: f.threshold, weight: f.weight ?? (1 / session!.surfacingRule.fields.length) }
+      sf[fieldKey(f)] = { threshold: f.threshold, weight: f.weight ?? (1 / session!.surfacingRule.fields.length), required: f.required }
     }
     setFieldSurfacing(sf)
     setBlocking(session!.blockingStrategy ?? 'auto')
@@ -419,7 +450,7 @@ export default function ConfigureScreen() {
       })
     setFields(draft)
     // Initialize surfacing per-field configs
-    const sf: Record<string, { threshold: number; weight: number }> = {}
+    const sf: Record<string, { threshold: number; weight: number; required?: boolean }> = {}
     for (const f of draft) {
       sf[fieldKey(f)] = { threshold: 0.8, weight: 1 / Math.max(draft.length, 1) }
     }
@@ -537,10 +568,11 @@ export default function ConfigureScreen() {
     // end up with five fields at 1/9 each, whose total could never reach the
     // combined threshold.
     const priorTotal = enabled.reduce((sum, f) => sum + (fieldSurfacing[fieldKey(f)]?.weight ?? 0), 0)
-    const sf: Record<string, { threshold: number; weight: number }> = {}
+    const sf: Record<string, { threshold: number; weight: number; required?: boolean }> = {}
     for (const f of enabled) {
       const cfg = fieldSurfacing[fieldKey(f)]
       sf[fieldKey(f)] = {
+        required: cfg?.required,
         threshold: cfg?.threshold ?? 0.8,
         weight: cfg && priorTotal > 0 ? cfg.weight / priorTotal : 1 / enabled.length,
       }
@@ -581,6 +613,7 @@ export default function ConfigureScreen() {
       legAlias: f.legAlias,
       threshold: fieldSurfacing[fieldKey(f)]?.threshold ?? 0.8,
       weight: fieldSurfacing[fieldKey(f)]?.weight ?? (1 / enabledFields.length),
+      required: fieldSurfacing[fieldKey(f)]?.required,
     }))
 
     const surfacingRule: SurfacingRule = {
@@ -1127,6 +1160,7 @@ export default function ConfigureScreen() {
                             legAlias: f.legAlias,
                             threshold: fieldSurfacing[fieldKey(f)]?.threshold ?? 0.8,
                             weight: fieldSurfacing[fieldKey(f)]?.weight ?? 0.5,
+                            required: fieldSurfacing[fieldKey(f)]?.required,
                           })),
                         combinedThreshold,
                       }))
@@ -1289,6 +1323,22 @@ export default function ConfigureScreen() {
                 <div key={name} className="bg-gray-900 rounded-xl border border-gray-800 px-5 py-4">
                   <div className="flex items-center gap-4">
                     <span className="font-medium text-white text-sm flex-1">{name}</span>
+                    <button
+                      onClick={() =>
+                        setFieldSurfacing((prev) => ({
+                          ...prev,
+                          [name]: { ...prev[name], required: !prev[name]?.required },
+                        }))
+                      }
+                      title="Fail the pair when either record lacks this field, instead of ignoring it"
+                      className={`text-xs px-1.5 py-0.5 rounded border ${
+                        cfg.required
+                          ? 'bg-sky-950 border-sky-700 text-sky-300'
+                          : 'bg-gray-900 border-gray-700 text-gray-500 hover:text-gray-300'
+                      }`}
+                    >
+                      both required
+                    </button>
                     {surfacingMode !== 'weighted-average' && (
                       <label className="flex items-center gap-2 text-xs text-gray-400">
                         Threshold

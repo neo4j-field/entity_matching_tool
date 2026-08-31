@@ -25,7 +25,10 @@ export function evaluateRule(
 ): Verdict {
   if (node.kind === 'field') {
     const key = fieldKey(node)
-    if (!comparable(key)) return undefined
+    // A required field that cannot be judged is a failure, not an absence: the
+    // condition asked for both records to carry it and they do not. Without
+    // `required` it stays unknown and the enclosing group decides on the rest.
+    if (!comparable(key)) return node.required ? false : undefined
     return (fieldScores.get(key) ?? 0) >= node.threshold
   }
 
@@ -33,6 +36,7 @@ export function evaluateRule(
     // Divide by the weights actually in play, so this is a mean rather than a
     // sum: weights drift away from totalling 1 whenever a field is removed or a
     // slider moves, and an unnormalised sum silently rescales the threshold.
+    if (node.children.some((c) => c.required && !comparable(fieldKey(c)))) return false
     const usable = node.children.filter((c) => comparable(fieldKey(c)))
     const totalWeight = usable.reduce((sum, c) => sum + c.weight, 0)
     if (usable.length === 0 || totalWeight <= 0) return undefined
@@ -74,6 +78,7 @@ export function ruleTree(rule: SurfacingRule): RuleNode {
         propertyName: f.propertyName,
         legAlias: f.legAlias,
         weight: f.weight,
+        required: f.required,
       })),
     }
   }
@@ -86,6 +91,7 @@ export function ruleTree(rule: SurfacingRule): RuleNode {
       propertyName: f.propertyName,
       legAlias: f.legAlias,
       threshold: f.threshold,
+      required: f.required,
     })),
   }
 }
@@ -94,7 +100,7 @@ export function ruleTree(rule: SurfacingRule): RuleNode {
 export function describeRule(node: RuleNode): string {
   if (node.kind === 'field') {
     const op = node.threshold >= 1 ? '=' : '≥'
-    return `${fieldKey(node)} ${op} ${node.threshold.toFixed(2)}`
+    return `${fieldKey(node)} ${op} ${node.threshold.toFixed(2)}${node.required ? ' (required)' : ''}`
   }
   if (node.kind === 'weighted') {
     const parts = node.children.map((c) => `${fieldKey(c)}×${c.weight.toFixed(2)}`)
