@@ -467,7 +467,6 @@ async function capturePrefix(
   signal: AbortSignal
 ): Promise<ScoreDistributions> {
   const allScores: PairScoreMap = new Map()
-  const snapshotMap = new Map<string, NodeSnapshot>()
   let surfacedTotal = 0
   const fingerprint = captureFingerprint(session)
   // Resume only a walk that is both unfinished and made under this exact
@@ -498,6 +497,19 @@ async function capturePrefix(
       // Only the nodes in this batch's pairs, so memory tracks the batch.
       const involved = new Set<string>()
       for (const { idA, idB } of batchScores.values()) { involved.add(idA); involved.add(idB) }
+      // Scoped to the batch, and released with it.
+      //
+      // This map used to live outside the loop and accumulate every node the
+      // walk had ever touched. Nothing after the batch needs them — densify,
+      // field presence and the pair rows all read only this batch — but the
+      // walk kept them all, and a pattern leg multiplied the cost: each
+      // snapshot now carries up to MAX_RELATED_PER_NODE related nodes per leg.
+      // A long walk therefore climbed until V8 gave up, reported as
+      // "Ineffective mark-compacts near heap limit" at 3,578 of 4,000 MB.
+      //
+      // It was also quadratic in time: fieldPresence below scans the whole map
+      // once per batch, so a walk of n batches scanned O(n^2) snapshots.
+      const snapshotMap = new Map<string, NodeSnapshot>()
       await loadSnapshots(neo4jSession, involved, snapshotMap, signal, session.legs ?? [])
       densify(session, batchScores, snapshotMap)
 
