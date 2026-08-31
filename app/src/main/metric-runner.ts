@@ -1,5 +1,5 @@
 import { fieldKey } from '../shared/field-key'
-import { evaluateRule, ruleTree } from '../shared/surfacing-tree'
+import { evaluateRule, ruleLeaves, ruleTree } from '../shared/surfacing-tree'
 import { createHash } from 'crypto'
 import { int } from 'neo4j-driver'
 import { getDriver } from './connection-service'
@@ -1074,7 +1074,7 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
 
     console.log(`[estimate] scoring ${sample.length} nodes across ${session.fields.length} fields`)
     t = Date.now()
-    const count = await surfacedCount(session, sample)
+    const { count, leafSupport } = await surfacedCount(session, sample)
     console.log(`[estimate] surfacedCount: ${count} in ${Date.now() - t}ms`)
     // Exact only when every node in the label was scored — both the fetch bound
     // and the candidate thinning have to have been no-ops.
@@ -1092,7 +1092,7 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
     const projectedCandidates = Math.round(candidates * (totalNodes / fetched.length))
 
     if (sample.length === totalNodes) {
-      return { count, exact: true, candidates, projectedCandidates: candidates }
+      return { count, exact: true, candidates, projectedCandidates: candidates, leafSupport }
     }
 
     const scale = pairCount(totalNodes) / pairCount(sample.length)
@@ -1106,6 +1106,7 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
       // and nothing else in the result reveals it.
       observed: count,
       projectedCandidates,
+      leafSupport,
     }
   } finally {
     neo4jSession.close().catch(() => {})
@@ -1157,7 +1158,10 @@ function countCandidates(session: Session, nodes: NodeSnapshot[]): number {
   return widest
 }
 
-async function surfacedCount(session: Session, nodes: NodeSnapshot[]): Promise<number> {
+async function surfacedCount(
+  session: Session,
+  nodes: NodeSnapshot[]
+): Promise<{ count: number; leafSupport: PairEstimate['leafSupport'] }> {
   const snapshots = new Map(nodes.map((n) => [n.id, n]))
   const fieldNodeIds = new Map<string, Set<string>>()
   const pairScores: PairScoreMap = new Map()
@@ -1195,11 +1199,26 @@ async function surfacedCount(session: Session, nodes: NodeSnapshot[]): Promise<n
 
   densify(session, pairScores, snapshots)
 
+  // Tally each leaf alongside the verdict, so an empty result can say which
+  // branch was responsible instead of only that there was none.
+  const leaves = ruleLeaves(ruleTree(session.surfacingRule))
+  const tally = new Map(leaves.map((l) => [`${l.key}|${l.threshold}`, { ...l, judged: 0, passed: 0 }]))
+
   let count = 0
   for (const { idA, idB, scores, abstained } of pairScores.values()) {
     if (surfaced(scores, session, idA, idB, fieldNodeIds, abstained)) count++
+
+    const best = new Map<string, number>()
+    for (const sc of scores) best.set(sc.fieldName, Math.max(best.get(sc.fieldName) ?? 0, sc.score))
+    for (const entry of tally.values()) {
+      const ids = fieldNodeIds.get(entry.key)
+      const judgeable = !abstained?.has(entry.key) && ids !== undefined && ids.has(idA) && ids.has(idB)
+      if (!judgeable) continue
+      entry.judged++
+      if ((best.get(entry.key) ?? 0) >= entry.threshold) entry.passed++
+    }
   }
-  return count
+  return { count, leafSupport: [...tally.values()] }
 }
 
 // Evenly spaced rather than random, so clicking Recalculate twice on unchanged

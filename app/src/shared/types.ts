@@ -339,6 +339,10 @@ export interface PairEstimate {
   // Absent for an incremental capture, which never builds a whole-label pair
   // set and so has nothing for that ceiling to apply to.
   projectedCandidates?: number
+  // Per-leaf support within the sample: how many pairs could judge each leaf of
+  // the rule, and how many passed it. A rule that surfaces nothing says nothing
+  // about which branch is responsible; this does.
+  leafSupport?: { key: string; threshold: number; judged: number; passed: number }[]
   // True when the estimate describes the next capture pass rather than the whole
   // label. `count` and `candidates` are then per-pass figures.
   //

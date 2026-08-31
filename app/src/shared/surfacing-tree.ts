@@ -116,3 +116,18 @@ export function ruleFieldKeys(node: RuleNode): string[] {
   if (node.kind === 'weighted') return node.children.map(fieldKey)
   return node.children.flatMap(ruleFieldKeys)
 }
+
+/**
+ * Every leaf of a rule, with the threshold it tests.
+ *
+ * Used to report which leaves a sample could judge and which passed, because a
+ * rule that surfaces nothing gives no clue on its own about which branch killed
+ * it — and the two causes need opposite fixes. A leaf nothing could judge means
+ * the field is not being compared, or its leg has no data; a leaf judged often
+ * but never passed means the threshold is too strict for this data.
+ */
+export function ruleLeaves(node: RuleNode): { key: string; threshold: number }[] {
+  if (node.kind === 'field') return [{ key: fieldKey(node), threshold: node.threshold }]
+  if (node.kind === 'weighted') return node.children.map((c) => ({ key: fieldKey(c), threshold: node.threshold }))
+  return node.children.flatMap(ruleLeaves)
+}

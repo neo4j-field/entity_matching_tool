@@ -1132,6 +1132,40 @@ export default function ConfigureScreen() {
                 <p className="text-xs text-gray-500 font-mono bg-gray-950 border border-gray-800 rounded px-3 py-2">
                   {describeRule(ruleNode)}
                 </p>
+                {/* Which leaf is responsible when a rule surfaces nothing. The
+                    two causes need opposite fixes: nothing judged means the
+                    field is not being compared or its leg has no data; judged
+                    but never passed means the threshold is too strict here. */}
+                {estimate?.leafSupport && estimate.leafSupport.length > 0 && (
+                  <div className="bg-gray-950 border border-gray-800 rounded px-3 py-2 space-y-1">
+                    <p className="text-xs text-gray-400">
+                      In the sample just estimated, each condition of this rule:
+                    </p>
+                    {estimate.leafSupport.map((l) => (
+                      <div key={`${l.key}|${l.threshold}`} className="flex items-center gap-2 text-xs font-mono">
+                        <span className="text-gray-300 w-56 truncate">{l.key} ≥ {l.threshold.toFixed(2)}</span>
+                        {l.judged === 0 ? (
+                          <span className="text-amber-400">never judged — this field is not compared, or its leg has no data</span>
+                        ) : l.passed === 0 ? (
+                          <span className="text-amber-400">
+                            judged {l.judged.toLocaleString()}×, passed 0 — nothing reaches this threshold
+                          </span>
+                        ) : (
+                          <span className="text-gray-500">
+                            judged {l.judged.toLocaleString()}×, passed {l.passed.toLocaleString()}×
+                            {' '}({((l.passed / l.judged) * 100).toFixed(1)}%)
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                    <p className="text-[11px] text-gray-600 pt-0.5">
+                      A condition every pair fails makes any ALL group containing it impossible. An
+                      exact match on a field that identifies a node — a company number, a URI — can
+                      never be true of two different nodes.
+                    </p>
+                  </div>
+                )}
+
                 <p className="text-xs text-gray-600">
                   A field neither node carries cannot be judged, so it is left out and the group is
                   decided on the rest — a group with nothing judged surfaces nothing. This is what
