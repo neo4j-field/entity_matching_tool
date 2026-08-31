@@ -31,6 +31,10 @@ import type { NodeRecord } from './metrics/types'
 // bounds a list-valued property's.
 const MAX_RELATED_PER_NODE = 10
 
+// Pairs held in memory at once while writing them to SQLite. Bounds the peak
+// independently of how many candidates a run produced.
+const PAIR_WRITE_CHUNK = 20_000
+
 const SNAPSHOT_BATCH_SIZE = 10_000
 
 export type ProgressEvent = {
@@ -632,12 +636,29 @@ async function scoreAndSurface(
   // changed — including lowered — and re-applied against real candidates rather
   // than guessed at and rescanned. Only surfaced pairs carry node snapshots:
   // storing them for all would cost 116 MB per pass on Company against 12 MB.
-  const allPairs: CandidatePair[] = []
+  // Written in chunks rather than built as one array.
+  //
+  // This used to hold only the surfaced pairs — thousands — and became every
+  // candidate when unsurfaced ones started being kept for re-filtering. That is
+  // up to MAX_CANDIDATE_PAIRS objects alive at once, next to a pairScores map of
+  // the same size and the snapshots, and it is enough to exhaust V8's heap and
+  // take the app down: the crash lands in LowMemoryNotification with no error a
+  // user can act on. Only the chunk is retained now, so the peak does not grow
+  // with the candidate count.
   let surfacedCount = 0
+  let stored = 0
+  let chunk: CandidatePair[] = []
+  const flush = (): void => {
+    if (chunk.length === 0) return
+    upsertPairs(chunk)
+    stored += chunk.length
+    chunk = []
+  }
+  const tWrite = Date.now()
   for (const [pairId, { idA, idB, scores, abstained }] of pairScores) {
     const isSurfaced = surfaced(scores, session, idA, idB, fields, abstained)
     if (isSurfaced) surfacedCount++
-    allPairs.push({
+    chunk.push({
       id: pairId,
       sessionId: session.id,
       label: session.label,
@@ -647,16 +668,15 @@ async function scoreAndSurface(
       verdict: 'pending',
       surfaced: isSurfaced,
     })
+    if (chunk.length >= PAIR_WRITE_CHUNK) flush()
   }
+  flush()
   console.log(
-    `[compute] ${surfacedCount} pairs surfaced, ${allPairs.length - surfacedCount} kept for re-filtering`
+    `[compute] ${surfacedCount} pairs surfaced, ${stored - surfacedCount} kept for re-filtering ` +
+      `(written in chunks of ${PAIR_WRITE_CHUNK} in ${Date.now() - tWrite}ms)`
   )
 
-  let t = Date.now()
-  upsertPairs(allPairs)
-  console.log(`[compute] upsertPairs: ${Date.now() - t}ms`)
-
-  t = Date.now()
+  const t = Date.now()
   const dists = computeDistributions(pairScores)
   console.log(`[compute] computeDistributions: ${Date.now() - t}ms`)
 
