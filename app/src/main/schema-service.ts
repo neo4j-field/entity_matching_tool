@@ -450,3 +450,50 @@ export async function relPatternHasData(pattern: RelPattern): Promise<boolean> {
     await session.close()
   }
 }
+
+/**
+ * How well a property would work as a prefix blocking key.
+ *
+ * Blocking compares a node only against others sharing its prefix, so the key
+ * has to divide the label into many small groups. A low-cardinality property
+ * does the opposite: `category` on a company register holds a handful of values,
+ * so every node's block is millions of nodes, every node hits the partner cap,
+ * and the partners are arbitrary nodes that happen to share a category.
+ *
+ * Measured on a 6.3M-node label blocked by `category`: one batch of 5,000 nodes
+ * produced 250,000 candidates and surfaced nothing, exhausting the pass's whole
+ * candidate budget on 0.08% of the label. Nothing errors — the queue is simply
+ * empty — which is why this is worth reporting before a run rather than after.
+ *
+ * Sampled rather than counted: an exact distinct-count over the label is a scan,
+ * and the ratio is obvious long before it is precise.
+ */
+export async function blockingKeyQuality(
+  label: string,
+  field: string,
+  prefixLength: number
+): Promise<{ sampled: number; distinctPrefixes: number; averageBlock: number }> {
+  const session = getDriver().session()
+  try {
+    const result = await session.run(
+      `MATCH (n:\`${label}\`) WHERE n.\`${field}\` IS NOT NULL
+       RETURN n.\`${field}\` AS v LIMIT 5000`
+    )
+    const prefixes = new Set<string>()
+    let sampled = 0
+    for (const record of result.records) {
+      const value = record.get('v')
+      if (typeof value !== 'string') continue
+      sampled++
+      prefixes.add(value.slice(0, prefixLength))
+    }
+    const distinctPrefixes = prefixes.size
+    return {
+      sampled,
+      distinctPrefixes,
+      averageBlock: distinctPrefixes > 0 ? sampled / distinctPrefixes : 0,
+    }
+  } finally {
+    await session.close()
+  }
+}

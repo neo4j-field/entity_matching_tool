@@ -241,6 +241,11 @@ export default function ConfigureScreen() {
   const [combinedThreshold, setCombinedThreshold] = useState(0.85)
   const [blocking, setBlocking] = useState<BlockingStrategy>('auto')
   const [blockingField, setBlockingField] = useState<string>('')
+  // Tagged with what it was measured for, so a stale reading is never shown
+  // against a different key — and so the effect never clears it synchronously.
+  const [blockingQuality, setBlockingQuality] = useState<
+    { field: string; prefixLength: number; sampled: number; distinctPrefixes: number; averageBlock: number } | null
+  >(null)
   const [prefixLength, setPrefixLength] = useState(8)
   const [estimate, setEstimate] = useState<PairEstimate | null>(null)
   const [estimating, setEstimating] = useState(false)
@@ -257,6 +262,23 @@ export default function ConfigureScreen() {
 
   // A prefix predicate has to touch the raw property, so it needs an index that
   // supports a range seek. Anything else means a full label scan per node.
+  // A blocking key only works if it splits the label into many small groups.
+  // Checked whenever the key or length changes, because picking a
+  // low-cardinality one fails silently: the run does not error, it produces an
+  // empty queue after burning its whole candidate budget on a fraction of the
+  // label.
+  useEffect(() => {
+    if (blocking !== 'prefix' || !selectedLabel) return
+    const field = blockingField || seekable[0]?.name
+    if (!field) return
+    let cancelled = false
+    window.api.schema
+      .blockingQuality(selectedLabel.name, field, prefixLength)
+      .then((q) => { if (!cancelled) setBlockingQuality({ field, prefixLength, ...q }) })
+      .catch(() => undefined)
+    return () => { cancelled = true }
+  }, [blocking, blockingField, prefixLength, selectedLabel])
+
   const seekable = (selectedLabel?.properties ?? []).filter((p) =>
     p.indexes?.some((k) => k === 'RANGE' || k === 'TEXT')
   )
@@ -1394,6 +1416,34 @@ export default function ConfigureScreen() {
                     Case-sensitive, because the lookup reads the property as stored — a value
                     beginning &ldquo;AC&rdquo; is not found by a search for &ldquo;ac&rdquo;.
                   </p>
+                  {/* Measured on this label: a key whose values collapse to a few
+                      prefixes puts every node in one enormous block, so every
+                      node hits the 50-partner cap and its partners are arbitrary
+                      nodes that merely share the value. Blocking Company by
+                      `category` produced 250,000 candidates and surfaced nothing
+                      from 0.08% of the label, with no error anywhere. */}
+                  {blockingQuality &&
+                    blockingQuality.sampled > 0 &&
+                    blockingQuality.field === (blockingField || seekable[0].name) &&
+                    blockingQuality.prefixLength === prefixLength && (
+                    blockingQuality.averageBlock > 20 ? (
+                      <p className="text-xs text-amber-400">
+                        ⚠ Poor blocking key: {blockingQuality.sampled.toLocaleString()} sampled values
+                        share only {blockingQuality.distinctPrefixes.toLocaleString()} distinct
+                        {' '}{prefixLength}-character prefixes — about{' '}
+                        {Math.round(blockingQuality.averageBlock).toLocaleString()} nodes per block.
+                        Every node will be compared against an arbitrary handful of the block, most
+                        pairs will be unrelated, and the queue is likely to come back empty. Choose a
+                        key with many distinct values, such as a name or an address line.
+                      </p>
+                    ) : (
+                      <p className="text-xs text-gray-600">
+                        {blockingQuality.sampled.toLocaleString()} sampled values give{' '}
+                        {blockingQuality.distinctPrefixes.toLocaleString()} distinct prefixes — about{' '}
+                        {blockingQuality.averageBlock.toFixed(1)} nodes per block.
+                      </p>
+                    )
+                  )}
                 </div>
               )}
 

@@ -12,6 +12,7 @@ export const IPC = {
 
   // Schema
   SCHEMA_DISCOVER: 'schema:discover',
+  SCHEMA_BLOCKING_QUALITY: 'schema:blockingQuality',
   SCHEMA_VALIDATE_PATTERN: 'schema:validatePattern',
   SCHEMA_ESTIMATE_PAIRS: 'schema:estimatePairs',
 

@@ -296,6 +296,11 @@ function registerIpc() {
 
   // Schema
   ipcMain.handle(IPC.SCHEMA_DISCOVER, () => schema.discoverSchema())
+  ipcMain.handle(
+    IPC.SCHEMA_BLOCKING_QUALITY,
+    async (_, label: string, field: string, prefixLength: number) =>
+      schema.blockingKeyQuality(label, field, prefixLength)
+  )
   // A pattern the schema reports may still match nothing — visualization()
   // returns label-pair combinations, not only observed ones.
   ipcMain.handle(IPC.SCHEMA_VALIDATE_PATTERN, async (_, pattern: RelPattern) =>
