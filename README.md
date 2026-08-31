@@ -19,7 +19,7 @@ which configuration produced them.
 The tool guides you through a four-step workflow:
 
 1. **Connect** — Save a Bolt connection profile (credentials stored in the OS keychain via keytar, never in plaintext). Test connectivity and discover the graph schema automatically.
-2. **Configure** — Select an entity label, choose which properties to compare, assign similarity metrics with per-metric thresholds, and set a surfacing rule that controls which pairs enter the review queue. If an Anthropic API key is set, the **✦ Ask AI to suggest** button will recommend fields, metrics, and thresholds based on the property names and sample values, with a per-field explanation of the reasoning.
+2. **Configure** — Select an entity label, choose which properties to compare, assign similarity metrics with per-metric thresholds, and set a surfacing rule that controls which pairs enter the review queue. Properties one hop away can join the comparison — an address, a ticker, a parent company — see [Matching across a relationship](#matching-across-a-relationship). The rule can be one of three named modes or a boolean expression you build. If an Anthropic API key is set, the **✦ Ask AI to suggest** button will recommend fields, metrics, and thresholds based on the property names and sample values, with a per-field explanation of the reasoning.
 3. **Compute** — Score the candidate pairs the chosen blocking strategy produces. Progress is streamed per metric, and the summary reports how candidates were chosen and — for an incremental capture — how far the walk reached. After completion, interactive score-distribution histograms let you adjust thresholds before proceeding.
 4. **Review** — Work through the pair queue, mark each as **Duplicate** or **Distinct**, add notes, inspect relationships and source passages, and apply merges when ready. The **✦ AI Classify…** button previews the run — how many requests, the shared-prompt size, and the estimated cost — then, once you confirm, sends pending pairs to Claude in batches for automated Duplicate/Distinct recommendations with reasoning stored in the Notes field (cancelable mid-run, with running spend shown as it goes). Pairs you have already reviewed are included in the prompt as worked examples, so accuracy improves as you review. After applying merges, choose to return to the Session list or stay in review. Use **Re-run Compute →** to run a second scoring pass on the same session (e.g. to surface transitive duplicates after merging) — existing verdicts are preserved, and the pass only ever adds to the queue (see [Re-running compute](#re-running-compute)). On a partially captured label, **Capture more** continues the walk from where it stopped; **Re-apply Thresholds** re-judges what is already captured without rescanning.
 
@@ -65,6 +65,27 @@ The trade is a judgement about your data, not about its size, which is why the c
 
 - **Token bucketing** never offers two records that share no word. Measured on a 244-node label, 824 of 29,646 possible pairs — 2.8% — were never scored at all. It also discards any token shared by more than **500** values, so a word common enough to be useless as a key stops blocking altogether: two records whose only shared word is `LIMITED` are never compared.
 - **Prefix blocking** compares each node against at most **50** partners sharing its prefix. On a prefix that thousands of nodes share, the rest are not offered — which is the mechanism that keeps a dense block from exploding, and equally the reason a short prefix on a low-cardinality key finds little.
+
+**The blocking key has to divide the label into many small groups**, and picking
+one that does not is the single easiest way to get an empty queue with no error.
+Configure samples 5,000 values whenever the key or the prefix length changes and
+reports nodes per block, warning when it is large. Measured on a 6.3M-node
+company register:
+
+```
+category @8            1 distinct prefix,  ~5000 per block   ⚠
+status @8              2 distinct,         ~2500 per block   ⚠
+countryOfOrigin @8    25 distinct,          ~200 per block   ⚠
+name @8             4479 distinct,           ~1.1 per block   ok
+companyNumber @8    4267 distinct,           ~1.2 per block   ok
+```
+
+Blocking that label by `category` produced **250,000 candidates, 0 surfaced,
+5,000 nodes walked** — every node hit the 50-partner cap because "Private
+Limited Company" is a block of millions, the partners were arbitrary companies
+that merely shared a category, and the pass spent its entire candidate budget on
+0.08% of the label. Nothing errored. Use a key with many distinct values: a name,
+an address line, an identifier.
 
 **Prefix blocking requires an index.** The predicate is `n.prop STARTS WITH x`, which plans as an index seek on a RANGE or TEXT index and as a full label scan per node without one — 0.26 ms per node against 13 seconds. Configure therefore offers only indexed properties as blocking keys. It cannot tell a good key from a bad one: pick something with many distinct values (`name`, `addressLine1`), not `status` or `country`, which are indexed and useless because a prefix of them describes millions of nodes.
 
@@ -167,15 +188,157 @@ Declining is not failing. A field where every configured metric declined is skip
 
 ---
 
+## Matching across a relationship
+
+A node's identity often is not contained in its own properties. Two companies
+with similar names are a different question depending on whether they share an
+address. Configure therefore offers **Related nodes**: properties one hop away
+that join the same rule.
+
+```
+(Company)-[:HAS_ADDRESS]->(Address)      as address
+(Company)-[:CLASSIFIED_AS]->(SICCode)    as sic
+```
+
+giving one session `name`, `address.postCode` and `sic.code`, all judged
+together on one pair. Several relationships can be added at once, in either
+direction.
+
+**One label is primary, and it is the only thing that merges.** In the example
+that is `Company`: a merge combines Company nodes and never touches an Address.
+
+**A shared related node is not a grouping key.** If one address is linked from
+fifty companies, those fifty do not become candidates for each other. The
+related node supplies *values to compare*, nothing more, and every primary node
+is still matched independently, pair by pair. This matters because the opposite
+reading is the intuitive one and it is wrong — a registered-agent address is
+shared by hundreds of unrelated businesses.
+
+Details worth knowing before you configure one:
+
+- **A node with several related nodes is compared against all of them**, keeping
+  the best score, capped at ten per leg. A node with none cannot be judged on
+  those fields, so they are skipped rather than failed — unless you mark them
+  required, below.
+- **When a pair is itself linked, each node is dropped from the other's related
+  set.** Otherwise a company and its former self would each carry the other's
+  name as independent evidence about itself, and score highly for being linked
+  rather than for being alike.
+- **Blocking keys stay on the primary label.** Related fields contribute to
+  scoring, not to deciding which pairs are worth scoring.
+- **Some offered relationships have no data.** The database reports label-pair
+  combinations rather than only observed ones — on one test graph 5 of 30 matched
+  nothing — so each leg is checked and marked `✓ has data` or `⚠ no data`. A leg
+  with none is dropped rather than saved as configuration that cannot work.
+- **Two legs can secretly be the same leg.** Where nodes carry several labels,
+  one relationship appears under each: on a company register every `PreviousName`
+  node is also a `Company`, so `PREVIOUSLY_NAMED→Company` and
+  `PREVIOUSLY_NAMED→PreviousName` are the same 647,358 edges. Selecting both
+  counts one piece of evidence twice, and Configure warns.
+
+---
+
 ## Surfacing rules
 
-Controls which scored pairs enter the review queue:
+Controls which scored pairs enter the review queue. Three named modes, and a
+fourth option that generalises them:
 
 - **Any field** — surface if any field score meets its threshold
-- **All fields** — surface only if every field *the two nodes can be compared on* meets its threshold
+- **All fields** — surface only if every field *the two nodes can be compared on* meets its threshold, unless a field is marked required (see below)
 - **Weighted average** — surface if the weighted *mean* of the field scores that could be judged meets a combined threshold
+- **Custom rule** — a boolean expression, below
 
-**Estimate Pair Count** on the Configure screen answers the rule you have actually selected. It runs the real pipeline — candidate generation, score fill-in, and the same surfacing test compute uses — so All and Weighted Average are counted on real scores rather than on a candidate-pair bound. The number is exact. Under prefix blocking it estimates the next capture pass instead; see [Scale and limits](#scale-and-limits).
+### A rule as an expression
+
+Choosing **Custom rule** turns the rule into a tree of conditions:
+
+```
+name ≥ 0.97
+OR ( name ≥ 0.92
+     AND ( (address.postCode = 1.00 AND address.postTown = 1.00)
+           OR (sic.code = 1.00 AND category = 1.00 AND countryOfOrigin = 1.00)
+           OR address.addressLine1 ≥ 0.95 ) )
+```
+
+Groups nest to any depth, each toggling between ALL of and ANY of, and a
+weighted average can sit inside one as a condition of its own. Switching to
+Custom seeds the expression from whichever named mode is showing, so nothing is
+lost by trying it — the three modes are exact special cases of the tree, not
+approximations.
+
+**A condition has three outcomes, not two.** It passes, it fails, or *it cannot
+be judged* — the last when neither record carries the field, or every metric
+declined it. Conditions that cannot be judged are left out and the group is
+decided on the rest; a group with nothing judged surfaces nothing.
+
+That is what All fields has always done, but written as `AND` it reads like a
+stronger promise than it makes, and the consequence surprises people:
+
+| stored scores | `name ≥ 0.9 AND (postTown = 1 AND country = 1)` |
+|---|---|
+| name only, address absent | **surfaces** |
+| name, postTown, no country | **surfaces** |
+| name fails | does not surface |
+
+Adding conditions can therefore *increase* the number of pairs. Measured on one
+label: `name = 1.00 AND postCode = 1.00` surfaced 816 pairs, while
+`name ≥ 0.95 AND postCode = 1 AND postTown = 1 AND sic = 1` surfaced **2,548** —
+three times more, because on pairs with no address or SIC data the longer rule
+quietly collapses to `name ≥ 0.95` alone.
+
+### Requiring a field to be present
+
+When a field is the point of the comparison rather than a bonus, mark the
+condition **both required**. An unjudgeable required condition then *fails*
+rather than being ignored — "only compare companies where both records have an
+address line".
+
+It is per condition rather than rule-wide on purpose: in the example above,
+requiring a SIC code across the whole rule would discard the pairs the address
+branch exists to catch. Inside an `AND` it kills the branch; inside an `OR` it
+fails only that branch, so each branch can police its own prerequisite. Measured
+on `name ≥ 0.92 AND address.addressLine1 ≥ 0.80`: 2,027 pairs surfaced, 810 with
+the address line required.
+
+The same toggle appears on the named modes, which have the same notion.
+
+### Why a rule surfaces nothing
+
+**Estimate Pair Count reports each condition separately**, which is the fastest
+way to find the branch responsible:
+
+```
+name >= 0.85               judged 28817, passed 10 (0.0%)
+country >= 1.00            judged 28682, passed 28680 (100.0%)
+airport_id >= 1.00         judged 11968, passed 10 (0.1%)
+nonexistent_field >= 0.50  NEVER JUDGED
+```
+
+Two failures, needing opposite fixes:
+
+- **Never judged** — the field is not enabled on Fields & Metrics, or its leg has
+  no data. The condition is unjudgeable for every pair, and a rule made only of
+  these surfaces nothing at all. Easy to hit, because the rule and the fields are
+  edited on different screens.
+- **Judged but never passed** — the threshold is unreachable on this data, and any
+  ALL group containing it is impossible. An exact match on a field that
+  *identifies* a node can never be true of two different nodes: a company number
+  with 5,695,465 distinct values across 6,342,823 companies will never equal
+  another company's.
+
+**A field left out of the rule is not left out of the search.** Candidate
+generation is the union across every enabled field, so a field the rule never
+mentions still widens the set of pairs considered and can bring in pairs the rule
+then accepts. On one label, adding a single unreferenced field took the candidate
+set from 5,744 to 28,817 and surfaced one extra pair. Configure lists any
+compared field the rule does not use; deselect it to narrow the search and make
+compute cheaper.
+
+**The thresholds on the Compute screen are not these thresholds.** Those mark a
+score as a match for review and for the AI; surfacing reads only the rule's own
+thresholds. Moving them will never change what is in the queue.
+
+**Estimate Pair Count** on the Configure screen answers the rule you have actually selected. It runs the real pipeline — candidate generation, score fill-in, and the same surfacing test compute uses — so All and Weighted Average are counted on real scores rather than on a candidate-pair bound. The number is exact. It also reports each condition of the rule separately — see [Why a rule surfaces nothing](#why-a-rule-surfaces-nothing). Under prefix blocking it estimates the next capture pass instead; see [Scale and limits](#scale-and-limits).
 
 It stays bounded on large labels through two limits. The fetch itself stops at 20,000 nodes — the query carries the `LIMIT`, so the estimate never pulls a whole label into memory. Then, if those nodes still yield more than 50,000 candidate pairs, an evenly spaced subset of them is scored instead.
 
@@ -379,7 +542,9 @@ Open **Settings** from the top nav bar.
 | Connection passwords | OS keychain via keytar |
 | All other settings | Same SQLite database |
 
-Sessions can be exported at any point from the review panel as CSV or JSON, filtered by verdict. CSV carries `node_a_<field>` and `node_b_<field>` for every field the session matched on, alongside the per-metric scores, so the numbers can be read against the values that produced them. JSON carries the whole pair, including every property of both nodes.
+Sessions can be exported at any point from the review panel as CSV or JSON, filtered by verdict. CSV carries `node_a_<field>` and `node_b_<field>` for every field the session matched on, including fields reached over a leg — a related field's values are joined into one cell — alongside the per-metric scores, so the numbers can be read against the values that produced them. JSON carries the whole pair, including every property of both nodes.
+
+A surfaced pair's stored snapshot also carries the related nodes its legs reach, so the review panel and the export can show them without a second query.
 
 Candidates that were scored but did not surface are stored too, which is what makes [threshold re-filtering](#tuning-thresholds-without-rescanning) possible. They hold ids and scores but no node snapshots — roughly 12 MB per 100,000 candidates — and never appear in the queue or in an export.
 
@@ -418,6 +583,10 @@ src/
     lib/usage.ts      Cost and token formatting helpers
   shared/
     types.ts          All shared TypeScript types
+    field-key.ts      Field identity — bare for the primary label,
+                      alias.property for one reached over a leg
+    surfacing-tree.ts Rule evaluation, three-valued, and the exact
+                      conversion of the three named modes into it
     ipc-channels.ts   Typed IPC channel constants
     constants.ts      Runtime defaults (model, batch size, concurrency)
 
