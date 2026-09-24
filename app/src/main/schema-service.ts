@@ -90,31 +90,38 @@ export async function discoverSchema(): Promise<SchemaModel> {
     // part to be careful with: matching one vocabulary and not the other is
     // what once classified every property as kind 'other'.
     const tTypes = Date.now()
-    const propResult = await session.run(
-      apocAvailable
-        ? `CALL apoc.meta.nodeTypeProperties({sample: ${SCHEMA_SAMPLE_RATE}})
-           YIELD nodeLabels, propertyName, propertyTypes, mandatory
-           RETURN nodeLabels, propertyName, propertyTypes, mandatory
-           ORDER BY nodeLabels, propertyName`
-        : `CALL db.schema.nodeTypeProperties()
-           YIELD nodeLabels, propertyName, propertyTypes, mandatory
-           RETURN nodeLabels, propertyName, propertyTypes, mandatory
-           ORDER BY nodeLabels, propertyName`
-    )
-    queryCount++
+    const nodeTypeQuery = apocAvailable
+      ? `CALL apoc.meta.nodeTypeProperties({sample: ${SCHEMA_SAMPLE_RATE}})
+         YIELD nodeLabels, propertyName, propertyTypes, mandatory
+         RETURN nodeLabels, propertyName, propertyTypes, mandatory
+         ORDER BY nodeLabels, propertyName`
+      : `CALL db.schema.nodeTypeProperties()
+         YIELD nodeLabels, propertyName, propertyTypes, mandatory
+         RETURN nodeLabels, propertyName, propertyTypes, mandatory
+         ORDER BY nodeLabels, propertyName`
+    const relTypeQuery = apocAvailable
+      ? `CALL apoc.meta.relTypeProperties({sample: ${SCHEMA_SAMPLE_RATE}})
+         YIELD relType, propertyName, propertyTypes
+         RETURN relType, propertyName, propertyTypes
+         ORDER BY relType`
+      : `CALL db.schema.relTypeProperties()
+         YIELD relType, propertyName, propertyTypes
+         RETURN relType, propertyName, propertyTypes
+         ORDER BY relType`
 
-    const relResult = await session.run(
-      apocAvailable
-        ? `CALL apoc.meta.relTypeProperties({sample: ${SCHEMA_SAMPLE_RATE}})
-           YIELD relType, propertyName, propertyTypes
-           RETURN relType, propertyName, propertyTypes
-           ORDER BY relType`
-        : `CALL db.schema.relTypeProperties()
-           YIELD relType, propertyName, propertyTypes
-           RETURN relType, propertyName, propertyTypes
-           ORDER BY relType`
-    )
-    queryCount++
+    // These two are independent, and together they are most of what connecting
+    // costs: 6.2s and 6.1s of a 19.2s discovery on a 59-label graph. Both
+    // procedures sample per label and per relationship type, so the cost tracks
+    // how many kinds a schema has rather than how many nodes — a 6-label graph
+    // of 6.3M nodes runs them far faster than a small graph with 59 labels.
+    //
+    // A session executes its queries in sequence, so overlapping them needs a
+    // session each.
+    const [propResult, relResult] = await Promise.all([
+      runOnOwnSession(driver, nodeTypeQuery),
+      runOnOwnSession(driver, relTypeQuery),
+    ])
+    queryCount += 2
     console.log(
       `[schema] property types via ${apocAvailable ? 'apoc.meta.*' : 'db.schema.*'} ` +
         `in ${Date.now() - tTypes}ms`
@@ -493,6 +500,26 @@ export async function blockingKeyQuality(
       distinctPrefixes,
       averageBlock: distinctPrefixes > 0 ? sampled / distinctPrefixes : 0,
     }
+  } finally {
+    await session.close()
+  }
+}
+
+/**
+ * Run one query on a session of its own, so it can overlap with another.
+ *
+ * The driver serialises queries within a session; concurrency is per session,
+ * not per query.
+ */
+type QueryResult = Awaited<ReturnType<ReturnType<ReturnType<typeof getDriver>['session']>['run']>>
+
+async function runOnOwnSession(
+  driver: ReturnType<typeof getDriver>,
+  query: string
+): Promise<QueryResult> {
+  const session = driver.session()
+  try {
+    return await session.run(query)
   } finally {
     await session.close()
   }
