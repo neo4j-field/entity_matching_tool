@@ -1,6 +1,7 @@
 import { app, shell, BrowserWindow, ipcMain } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
+import appIcon from '../../resources/icon.png?asset'
 import { IPC } from '../shared/ipc-channels'
 import { refilterPairs } from './refilter-service'
 import { fieldKey } from '../shared/field-key'
@@ -43,6 +44,9 @@ function createWindow(): void {
     height: 900,
     show: false,
     autoHideMenuBar: true,
+    // macOS and Windows take the icon from the packaged bundle; Linux reads it
+    // from the window, which is what resources/icon.png is for.
+    ...(process.platform === 'linux' ? { icon: appIcon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
