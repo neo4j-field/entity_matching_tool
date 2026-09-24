@@ -739,13 +739,29 @@ async function loadLeg(
 ): Promise<void> {
   const arrow = leg.direction === 'out' ? '-[:`REL`]->' : '<-[:`REL`]-'
   const pattern = arrow.replace('REL', leg.relType)
+  // Limited per node, inside the subquery.
+  //
+  // This was `WITH n, m LIMIT $cap` over the whole batch, which is a global cap,
+  // not a per-node one: nodes appearing early in the result consumed the entire
+  // budget and every later node in the batch returned no row at all. Their
+  // snapshot never got a `related` section, so the leg's fields read as
+  // unjudgeable for every pair involving them — no values shown in review, and
+  // no scores. Same mistake as collecting a whole block before slicing it in the
+  // prefix walk.
+  //
+  // The subquery ends in an aggregation so a node with genuinely no related
+  // nodes still returns a row, with an empty list. That distinguishes "has none"
+  // from "was never asked".
   const result = await neo4jSession.run(
     `MATCH (n) WHERE elementId(n) IN $ids
-     MATCH (n)${pattern}(m:\`${leg.label}\`)
-     WITH n, m LIMIT $cap
-     RETURN elementId(n) AS id,
-            collect({ id: elementId(m), props: properties(m) })[..${MAX_RELATED_PER_NODE}] AS related`,
-    { ids: batch, cap: int(batch.length * MAX_RELATED_PER_NODE) }
+     CALL {
+       WITH n
+       MATCH (n)${pattern}(m:\`${leg.label}\`)
+       WITH m LIMIT ${MAX_RELATED_PER_NODE}
+       RETURN collect({ id: elementId(m), props: properties(m) }) AS related
+     }
+     RETURN elementId(n) AS id, related`,
+    { ids: batch }
   )
   for (const r of result.records) {
     const snap = into.get(r.get('id') as string)
