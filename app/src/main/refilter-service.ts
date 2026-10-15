@@ -1,5 +1,5 @@
 import { getDb } from './db'
-import { getDriver } from './connection-service'
+import { getDriver, getActiveDatabase } from './connection-service'
 import { applySurfacingRule, loadSnapshots } from './metric-runner'
 import { fieldKey } from '../shared/field-key'
 import type { MetricScore, NodeSnapshot, PatternLeg, RefilterResult, Session } from '../shared/types'
@@ -150,7 +150,7 @@ async function hydrate(
   signal?: AbortSignal
 ): Promise<void> {
   const driver = getDriver()
-  const neo4jSession = driver.session()
+  const neo4jSession = driver.session({ database: getActiveDatabase() })
   try {
     const ids = new Set<string>()
     for (const p of pairs) { ids.add(p.idA); ids.add(p.idB) }

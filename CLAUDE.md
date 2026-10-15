@@ -208,6 +208,18 @@ change to prompt shape needs a new variant string.
 
 **Settings loading** — `App.tsx` loads settings on mount via `window.api.settings.get().then(setSettings)`. The `.then()` call must not be dropped; if it is, `store.settings` stays `null` and any feature gated on `settings.anthropicKey` will be permanently disabled.
 
+**A connection profile's `database` must be threaded through every session** —
+`connect()` in `connection-service.ts` opens the driver but the driver itself has
+no notion of which database a profile picked; `getActiveDatabase()` tracks it
+separately and every `driver.session(...)` call across the main process
+(`schema-service.ts`, `metric-runner.ts`, `neo4j-storage.ts`, `merge-executor.ts`,
+`refilter-service.ts`, `index.ts`) must pass `{ database: getActiveDatabase() }`.
+Omitting it doesn't error — the session silently opens the server's default
+database instead, so a profile pointing at a non-default database (anything
+other than `neo4j`) reads as an empty graph with no labels, no error, just
+nothing. `testConnection()` got this right from the start; the rest of the app
+didn't until this was fixed — a new session-opening call site needs it too.
+
 ## Conventions
 
 - No comments unless the *why* is non-obvious. No docstrings.

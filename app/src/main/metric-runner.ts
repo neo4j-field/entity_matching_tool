@@ -2,7 +2,7 @@ import { fieldKey } from '../shared/field-key'
 import { evaluateRule, ruleLeaves, ruleTree } from '../shared/surfacing-tree'
 import { createHash } from 'crypto'
 import { int } from 'neo4j-driver'
-import { getDriver } from './connection-service'
+import { getDriver, getActiveDatabase } from './connection-service'
 import { getCachedSchema } from './schema-service'
 import { pairIdFor } from './pair-id'
 import { getMetric } from './metrics/registry'
@@ -50,7 +50,7 @@ export async function runMetrics(
   signal: AbortSignal
 ): Promise<ScoreDistributions> {
   const driver = getDriver()
-  const neo4jSession = driver.session()
+  const neo4jSession = driver.session({ database: getActiveDatabase() })
 
   // Map pairId → accumulated scores
   const pairScores: PairScoreMap = new Map()
@@ -1060,7 +1060,7 @@ async function estimatePrefixPass(
 
 export async function estimateSurfacedPairs(session: Session): Promise<PairEstimate> {
   const driver = getDriver()
-  const neo4jSession = driver.session()
+  const neo4jSession = driver.session({ database: getActiveDatabase() })
   try {
     // Size the label first — a count-store lookup, independent of label size —
     // so the fetch below can be bounded rather than discovered to be too large

@@ -1,4 +1,4 @@
-import { getDriver } from './connection-service'
+import { getDriver, getActiveDatabase } from './connection-service'
 import { mapWithConcurrency } from './concurrency'
 import { getSettings } from './settings-service'
 import { toJsNumber, sanitize } from './neo4j-int'
@@ -34,7 +34,7 @@ export async function discoverSchema(): Promise<SchemaModel> {
 
   const startedAt = Date.now()
   let queryCount = 0
-  const session = driver.session()
+  const session = driver.session({ database: getActiveDatabase() })
   try {
     // Probe APOC first — it decides which schema source to use below, and the
     // probe itself is a constant-time call.
@@ -196,7 +196,7 @@ export async function discoverSchema(): Promise<SchemaModel> {
       labelNames,
       LABEL_SAMPLE_CONCURRENCY,
       async (label): Promise<Record<string, unknown>[]> => {
-        const s = driver.session()
+        const s = driver.session({ database: getActiveDatabase() })
         try {
           const result = await s.run(
             `MATCH (n:\`${label}\`) RETURN properties(n) AS props LIMIT ${SAMPLE_NODE_LIMIT}`
@@ -446,7 +446,7 @@ async function discoverRelPatterns(
  * a pattern as usable. Measured at 208-640ms per pattern on a 9M-node database.
  */
 export async function relPatternHasData(pattern: RelPattern): Promise<boolean> {
-  const session = getDriver().session()
+  const session = getDriver().session({ database: getActiveDatabase() })
   try {
     const result = await session.run(
       `MATCH (a:\`${pattern.startLabel}\`)-[:\`${pattern.relType}\`]->(b:\`${pattern.endLabel}\`) ` +
@@ -480,7 +480,7 @@ export async function blockingKeyQuality(
   field: string,
   prefixLength: number
 ): Promise<{ sampled: number; distinctPrefixes: number; averageBlock: number }> {
-  const session = getDriver().session()
+  const session = getDriver().session({ database: getActiveDatabase() })
   try {
     const result = await session.run(
       `MATCH (n:\`${label}\`) WHERE n.\`${field}\` IS NOT NULL
@@ -517,7 +517,7 @@ async function runOnOwnSession(
   driver: ReturnType<typeof getDriver>,
   query: string
 ): Promise<QueryResult> {
-  const session = driver.session()
+  const session = driver.session({ database: getActiveDatabase() })
   try {
     return await session.run(query)
   } finally {

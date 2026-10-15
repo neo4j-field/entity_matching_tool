@@ -484,7 +484,7 @@ function registerIpc() {
   // Node detail
   ipcMain.handle(IPC.NODE_NEIGHBORS, async (_, nodeId: string) => {
     const driver = connection.getDriver()
-    const neo4jSession = driver.session()
+    const neo4jSession = driver.session({ database: connection.getActiveDatabase() })
     try {
       const result = await neo4jSession.run(
         `MATCH (n) WHERE elementId(n) = $id
@@ -517,7 +517,7 @@ function registerIpc() {
 
   ipcMain.handle(IPC.NODE_SOURCE_PASSAGES, async (_, nodeId: string) => {
     const driver = connection.getDriver()
-    const neo4jSession = driver.session()
+    const neo4jSession = driver.session({ database: connection.getActiveDatabase() })
     try {
       const result = await neo4jSession.run(
         `MATCH (n) WHERE elementId(n) = $id
