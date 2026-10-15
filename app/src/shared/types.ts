@@ -40,13 +40,36 @@ export interface LabelMeta {
 
 export interface RelTypeMeta {
   name: string
+  // Every label observed at each end of this type, across all its patterns.
+  // Useful for a summary; not enough to build a pattern from — see RelPattern.
   startLabels: string[]
   endLabels: string[]
+}
+
+/**
+ * One directed (start)-[:TYPE]->(end) shape the database reports.
+ *
+ * Kept as triples rather than as two label lists per type, because the lists
+ * only express their cross-product. PREVIOUSLY_NAMED runs Company→PreviousName
+ * and Company→Company; a type with two starts and two ends implies four
+ * patterns where only two exist, which is the phantom problem below.
+ *
+ * `db.schema.visualization()` reports combinations rather than only observed
+ * ones, so some of these have no data — 5 of 43 on one test database. Confirm
+ * with `relPatternHasData()` before offering a pattern as usable.
+ */
+export interface RelPattern {
+  relType: string
+  startLabel: string
+  endLabel: string
 }
 
 export interface SchemaModel {
   labels: LabelMeta[]
   relationshipTypes: RelTypeMeta[]
+  // Directed shapes connecting two non-excluded labels. Empty when the database
+  // does not support db.schema.visualization().
+  relPatterns: RelPattern[]
   discoveredAt: string // ISO string
   apocAvailable: boolean
 }
@@ -86,15 +109,34 @@ export interface MetricConfig {
   threshold: number
 }
 
+/**
+ * One node of the pattern a session matches on, other than the primary label.
+ *
+ * Exactly one hop from the primary node — legs never chain, so a cycle cannot
+ * extend. The alias is the field-key namespace and is embedded in stored score
+ * rows, so it is unique within a session and immutable once anything is scored.
+ */
+export interface PatternLeg {
+  alias: string
+  relType: string
+  direction: 'out' | 'in'
+  label: string
+}
+
 export interface FieldConfig {
   propertyName: string
+  // Absent = a property of the primary label. See fieldKey().
+  legAlias?: string
   metrics: MetricConfig[]
 }
 
 export interface FieldSurfacingConfig {
   propertyName: string
+  legAlias?: string
   threshold: number
   weight: number
+  // Carried into the leaf this field becomes. See RuleNode.
+  required?: boolean
 }
 
 /**
@@ -141,10 +183,45 @@ export interface CaptureState {
   fingerprint?: string
 }
 
+/**
+ * A surfacing rule as a boolean expression over fields.
+ *
+ * A `field` leaf is three-valued: it passes, fails, or cannot be judged at all
+ * when neither node carries the property. A `weighted` node holds leaves only —
+ * a mean needs numbers, and a group yields a verdict, so there is no score for
+ * `or(a, b)` to contribute to an average.
+ */
+export type RuleNode =
+  | {
+      kind: 'field'
+      propertyName: string
+      legAlias?: string
+      threshold: number
+      // When set, a pair that cannot be judged on this field fails the leaf
+      // rather than having it ignored — "both records must carry this". Absent
+      // is the default and means unjudgeable, which a group skips.
+      required?: boolean
+    }
+  | { kind: 'group'; op: 'and' | 'or'; children: RuleNode[] }
+  | { kind: 'weighted'; threshold: number; children: WeightedLeaf[] }
+
+export interface WeightedLeaf {
+  propertyName: string
+  legAlias?: string
+  weight: number
+  // A required field neither node carries fails the whole weighted node, rather
+  // than being dropped from the average.
+  required?: boolean
+}
+
 export interface SurfacingRule {
+  // The three original modes. Retained because sessions on disk store them, and
+  // ruleTree() converts them exactly rather than rewriting anyone's data.
   mode: 'any' | 'all' | 'weighted-average'
   fields: FieldSurfacingConfig[]
   combinedThreshold?: number
+  // Authoritative when present.
+  tree?: RuleNode
 }
 
 export interface MergePassSummary {
@@ -169,6 +246,8 @@ export interface Session {
   // 0.17ms per node.
   blockingField?: string
   blockingPrefixLength?: number
+  // Related nodes contributing fields. Absent for a single-label session.
+  legs?: PatternLeg[]
   capture?: CaptureState
   status: SessionStatus
   reviewCursor: number
@@ -181,9 +260,19 @@ export interface Session {
 
 // ─── Pairs ────────────────────────────────────────────────────────────────────
 
+export interface RelatedNode {
+  id: string
+  properties: Record<string, unknown>
+}
+
 export interface NodeSnapshot {
   id: string
   properties: Record<string, unknown>
+  // Nodes one hop away, by leg alias. Only present for sessions with legs, and
+  // only for pairs that surfaced — an unsurfaced candidate stores no snapshot
+  // at all. Carrying ids rather than bare values is what lets a pair exclude
+  // each node from the other's related set at comparison time.
+  related?: Record<string, RelatedNode[]>
 }
 
 export interface MetricScore {
@@ -264,6 +353,10 @@ export interface PairEstimate {
   // Absent for an incremental capture, which never builds a whole-label pair
   // set and so has nothing for that ceiling to apply to.
   projectedCandidates?: number
+  // Per-leaf support within the sample: how many pairs could judge each leaf of
+  // the rule, and how many passed it. A rule that surfaces nothing says nothing
+  // about which branch is responsible; this does.
+  leafSupport?: { key: string; threshold: number; judged: number; passed: number }[]
   // True when the estimate describes the next capture pass rather than the whole
   // label. `count` and `candidates` are then per-pass figures.
   //

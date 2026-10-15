@@ -21,6 +21,7 @@ import type {
   UsageTotals,
   PairEstimate,
   RefilterResult,
+  RelPattern,
 } from '../shared/types'
 
 // Push-event listener helpers
@@ -45,6 +46,14 @@ const api = {
   // ── Schema ──────────────────────────────────────────────────────────────────
   schema: {
     discover: () => ipcRenderer.invoke(IPC.SCHEMA_DISCOVER) as Promise<SchemaModel>,
+    blockingQuality: (label: string, field: string, prefixLength: number) =>
+      ipcRenderer.invoke(IPC.SCHEMA_BLOCKING_QUALITY, label, field, prefixLength) as Promise<{
+        sampled: number
+        distinctPrefixes: number
+        averageBlock: number
+      }>,
+    validatePattern: (pattern: RelPattern) =>
+      ipcRenderer.invoke(IPC.SCHEMA_VALIDATE_PATTERN, pattern) as Promise<boolean>,
     estimatePairs: (sessionId: string) =>
       ipcRenderer.invoke(IPC.SCHEMA_ESTIMATE_PAIRS, sessionId) as Promise<PairEstimate>,
   },

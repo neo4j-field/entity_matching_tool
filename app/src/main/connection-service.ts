@@ -8,6 +8,7 @@ import type { ConnectionProfile, TestConnectionResult } from '../shared/types'
 const SERVICE = 'neo4j-er-tool'
 let _driver: Driver | null = null
 let _activeProfileId: string | null = null
+let _activeDatabase: string | undefined = undefined
 
 // ── Profile CRUD (metadata in SQLite, password in keychain) ─────────────────
 
@@ -79,6 +80,7 @@ export async function connect(id: string): Promise<Driver> {
   _driver = neo4j.driver(profile.uri, neo4j.auth.basic(profile.username, password))
   await _driver.verifyConnectivity()
   _activeProfileId = id
+  _activeDatabase = profile.database || undefined
   return _driver
 }
 
@@ -87,6 +89,7 @@ export async function disconnect(): Promise<void> {
     await _driver.close()
     _driver = null
     _activeProfileId = null
+    _activeDatabase = undefined
   }
 }
 
@@ -97,4 +100,8 @@ export function getDriver(): Driver {
 
 export function getActiveProfileId(): string | null {
   return _activeProfileId
+}
+
+export function getActiveDatabase(): string | undefined {
+  return _activeDatabase
 }

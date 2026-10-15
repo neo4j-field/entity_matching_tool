@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import type { ReactElement } from 'react'
 import { useStore } from '../store'
+import { fieldKey } from '../../../shared/field-key'
 import AssistantPanel from '../components/AssistantPanel'
 import NodeRelationships from '../components/NodeRelationships'
 import SourcePassages from '../components/SourcePassages'
@@ -859,9 +860,33 @@ export default function ReviewScreen() {
                       ...Object.keys(currentPair.nodeA.properties),
                       ...Object.keys(currentPair.nodeB.properties),
                     ])
-                    return Array.from(allKeys).map((key) => {
-                      const va = currentPair.nodeA.properties[key]
-                      const vb = currentPair.nodeB.properties[key]
+                    // Values reached over a pattern leg, shown under alias.property
+                    // so they line up with the score rows below. A node can have
+                    // several related nodes, so these are lists.
+                    const relatedRows = new Map<string, [unknown, unknown]>()
+                    const collect = (side: 0 | 1): void => {
+                      const snap = side === 0 ? currentPair.nodeA : currentPair.nodeB
+                      for (const [alias, nodes] of Object.entries(snap.related ?? {})) {
+                        for (const rel of nodes) {
+                          for (const [prop, value] of Object.entries(rel.properties)) {
+                            if (value == null) continue
+                            const key = `${alias}.${prop}`
+                            const row = relatedRows.get(key) ?? [undefined, undefined]
+                            const prev = row[side]
+                            row[side] = prev == null ? String(value) : `${prev}, ${String(value)}`
+                            relatedRows.set(key, row)
+                          }
+                        }
+                      }
+                    }
+                    collect(0)
+                    collect(1)
+
+                    const rows: [string, unknown, unknown][] = [
+                      ...Array.from(allKeys).map((k) => [k, currentPair.nodeA.properties[k], currentPair.nodeB.properties[k]] as [string, unknown, unknown]),
+                      ...Array.from(relatedRows.entries()).map(([k, v]) => [k, v[0], v[1]] as [string, unknown, unknown]),
+                    ]
+                    return rows.map(([key, va, vb]) => {
                       const differs = JSON.stringify(va) !== JSON.stringify(vb)
                       return (
                         <div
@@ -887,7 +912,7 @@ export default function ReviewScreen() {
                 <h3 className="text-xs font-medium text-gray-400 uppercase tracking-wider">Scores</h3>
                 {currentPair.scores.map((s) => {
                   const threshold = session.fields
-                    .find((f) => f.propertyName === s.fieldName)
+                    .find((f) => fieldKey(f) === s.fieldName)
                     ?.metrics.find((m) => m.metricId === s.metricId)
                     ?.threshold ?? 0.8
                   return (

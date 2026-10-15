@@ -1,4 +1,4 @@
-import { getDriver } from './connection-service'
+import { getDriver, getActiveDatabase } from './connection-service'
 import { mapWithConcurrency } from './concurrency'
 import { getSettings } from './settings-service'
 import { toJsNumber, sanitize } from './neo4j-int'
@@ -9,6 +9,7 @@ import type {
   PropertyKind,
   PropertyIndexKind,
   RelTypeMeta,
+  RelPattern,
 } from '../shared/types'
 
 let _cached: SchemaModel | null = null
@@ -33,7 +34,7 @@ export async function discoverSchema(): Promise<SchemaModel> {
 
   const startedAt = Date.now()
   let queryCount = 0
-  const session = driver.session()
+  const session = driver.session({ database: getActiveDatabase() })
   try {
     // Probe APOC first — it decides which schema source to use below, and the
     // probe itself is a constant-time call.
@@ -89,31 +90,38 @@ export async function discoverSchema(): Promise<SchemaModel> {
     // part to be careful with: matching one vocabulary and not the other is
     // what once classified every property as kind 'other'.
     const tTypes = Date.now()
-    const propResult = await session.run(
-      apocAvailable
-        ? `CALL apoc.meta.nodeTypeProperties({sample: ${SCHEMA_SAMPLE_RATE}})
-           YIELD nodeLabels, propertyName, propertyTypes, mandatory
-           RETURN nodeLabels, propertyName, propertyTypes, mandatory
-           ORDER BY nodeLabels, propertyName`
-        : `CALL db.schema.nodeTypeProperties()
-           YIELD nodeLabels, propertyName, propertyTypes, mandatory
-           RETURN nodeLabels, propertyName, propertyTypes, mandatory
-           ORDER BY nodeLabels, propertyName`
-    )
-    queryCount++
+    const nodeTypeQuery = apocAvailable
+      ? `CALL apoc.meta.nodeTypeProperties({sample: ${SCHEMA_SAMPLE_RATE}})
+         YIELD nodeLabels, propertyName, propertyTypes, mandatory
+         RETURN nodeLabels, propertyName, propertyTypes, mandatory
+         ORDER BY nodeLabels, propertyName`
+      : `CALL db.schema.nodeTypeProperties()
+         YIELD nodeLabels, propertyName, propertyTypes, mandatory
+         RETURN nodeLabels, propertyName, propertyTypes, mandatory
+         ORDER BY nodeLabels, propertyName`
+    const relTypeQuery = apocAvailable
+      ? `CALL apoc.meta.relTypeProperties({sample: ${SCHEMA_SAMPLE_RATE}})
+         YIELD relType, propertyName, propertyTypes
+         RETURN relType, propertyName, propertyTypes
+         ORDER BY relType`
+      : `CALL db.schema.relTypeProperties()
+         YIELD relType, propertyName, propertyTypes
+         RETURN relType, propertyName, propertyTypes
+         ORDER BY relType`
 
-    const relResult = await session.run(
-      apocAvailable
-        ? `CALL apoc.meta.relTypeProperties({sample: ${SCHEMA_SAMPLE_RATE}})
-           YIELD relType, propertyName, propertyTypes
-           RETURN relType, propertyName, propertyTypes
-           ORDER BY relType`
-        : `CALL db.schema.relTypeProperties()
-           YIELD relType, propertyName, propertyTypes
-           RETURN relType, propertyName, propertyTypes
-           ORDER BY relType`
-    )
-    queryCount++
+    // These two are independent, and together they are most of what connecting
+    // costs: 6.2s and 6.1s of a 19.2s discovery on a 59-label graph. Both
+    // procedures sample per label and per relationship type, so the cost tracks
+    // how many kinds a schema has rather than how many nodes — a 6-label graph
+    // of 6.3M nodes runs them far faster than a small graph with 59 labels.
+    //
+    // A session executes its queries in sequence, so overlapping them needs a
+    // session each.
+    const [propResult, relResult] = await Promise.all([
+      runOnOwnSession(driver, nodeTypeQuery),
+      runOnOwnSession(driver, relTypeQuery),
+    ])
+    queryCount += 2
     console.log(
       `[schema] property types via ${apocAvailable ? 'apoc.meta.*' : 'db.schema.*'} ` +
         `in ${Date.now() - tTypes}ms`
@@ -188,7 +196,7 @@ export async function discoverSchema(): Promise<SchemaModel> {
       labelNames,
       LABEL_SAMPLE_CONCURRENCY,
       async (label): Promise<Record<string, unknown>[]> => {
-        const s = driver.session()
+        const s = driver.session({ database: getActiveDatabase() })
         try {
           const result = await s.run(
             `MATCH (n:\`${label}\`) RETURN properties(n) AS props LIMIT ${SAMPLE_NODE_LIMIT}`
@@ -265,6 +273,28 @@ export async function discoverSchema(): Promise<SchemaModel> {
         relMap.set(relType, { name: relType, startLabels: [], endLabels: [] })
       }
     }
+
+    // Which labels each type actually connects. apoc.meta.relTypeProperties and
+    // db.schema.relTypeProperties both yield only the type and its properties,
+    // so this was previously unknowable and startLabels/endLabels were always
+    // empty. db.schema.visualization() is the only source that gives endpoints
+    // with a direction, and it is built in — no new APOC dependency on a path
+    // that already degrades 6s to 46s without it. Measured: 1825ms cold and
+    // 156ms warm on a 9M-node database.
+    const tViz = Date.now()
+    const relPatterns = await discoverRelPatterns(session, excludedLabels)
+    queryCount++
+    for (const pat of relPatterns) {
+      const entry = relMap.get(pat.relType) ?? { name: pat.relType, startLabels: [], endLabels: [] }
+      if (!entry.startLabels.includes(pat.startLabel)) entry.startLabels.push(pat.startLabel)
+      if (!entry.endLabels.includes(pat.endLabel)) entry.endLabels.push(pat.endLabel)
+      relMap.set(pat.relType, entry)
+    }
+    console.log(
+      `[schema] ${relPatterns.length} relationship patterns via db.schema.visualization() ` +
+        `in ${Date.now() - tViz}ms`
+    )
+
     const relationshipTypes = Array.from(relMap.values())
 
     console.log(
@@ -272,7 +302,13 @@ export async function discoverSchema(): Promise<SchemaModel> {
         `in ${Date.now() - startedAt}ms across ${queryCount} queries`
     )
 
-    _cached = { labels, relationshipTypes, discoveredAt: new Date().toISOString(), apocAvailable }
+    _cached = {
+      labels,
+      relationshipTypes,
+      relPatterns,
+      discoveredAt: new Date().toISOString(),
+      apocAvailable,
+    }
     return _cached
   } finally {
     await session.close()
@@ -339,4 +375,152 @@ function inferKind(meta: PropertyMeta): PropertyKind {
   if (avgLen < 20 && identifierLike > 0.5) return 'identifier'
   if (avgLen > 100) return 'text'
   return 'name'
+}
+
+/**
+ * Directed (start)-[:TYPE]->(end) shapes, from the built-in schema procedure.
+ *
+ * Patterns touching an excluded label are dropped here rather than by the
+ * caller: on a GraphRAG database 11 of 43 patterns are FROM_CHUNK plumbing, and
+ * on a database this tool has written back to, its own ERPair and ERPairScore
+ * nodes appear as candidates.
+ *
+ * Failure is not fatal. A database that cannot run the procedure keeps every
+ * other part of discovery; callers see an empty list and offer no patterns.
+ */
+async function discoverRelPatterns(
+  session: ReturnType<ReturnType<typeof getDriver>['session']>,
+  excludedLabels: string[]
+): Promise<RelPattern[]> {
+  let result
+  try {
+    result = await session.run('CALL db.schema.visualization()')
+  } catch (err) {
+    console.log(`[schema] db.schema.visualization() unavailable: ${(err as Error).message}`)
+    return []
+  }
+  const record = result.records[0]
+  if (!record) return []
+
+  // Relationships carry the identities of their endpoints, not the nodes, so
+  // they have to be resolved through the node list in the same row.
+  // One node per label is what the procedure returns. Anything else is a shape
+  // this does not understand, and joining the labels would invent a name no
+  // database has — so skip it rather than offer a pattern that cannot match.
+  const labelById = new Map<string, string>()
+  for (const node of (record.get('nodes') ?? []) as { identity: unknown; labels: string[] }[]) {
+    if (node.labels.length !== 1) {
+      console.log(`[schema] skipping schema node with ${node.labels.length} labels: ${node.labels.join(', ')}`)
+      continue
+    }
+    labelById.set(String(node.identity), node.labels[0])
+  }
+
+  const patterns: RelPattern[] = []
+  const seen = new Set<string>()
+  for (const rel of (record.get('relationships') ?? []) as {
+    start: unknown
+    end: unknown
+    type: string
+  }[]) {
+    const startLabel = labelById.get(String(rel.start))
+    const endLabel = labelById.get(String(rel.end))
+    if (!startLabel || !endLabel) continue
+    if (excludedLabels.includes(startLabel) || excludedLabels.includes(endLabel)) continue
+    const key = `${startLabel}|${rel.type}|${endLabel}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    patterns.push({ relType: rel.type, startLabel, endLabel })
+  }
+  return patterns
+}
+
+/**
+ * Whether a pattern has any data at all.
+ *
+ * db.schema.visualization() reports label-pair combinations rather than only
+ * observed ones: on one test database 5 of 43 patterns matched nothing, among
+ * them (Occurrence)-[:PART_OF]->(Aircraft). Configuring one of those would
+ * produce a session that silently surfaces no pairs — no error, an empty queue,
+ * the same failure mode as a blocking key with no index. Check before offering
+ * a pattern as usable. Measured at 208-640ms per pattern on a 9M-node database.
+ */
+export async function relPatternHasData(pattern: RelPattern): Promise<boolean> {
+  const session = getDriver().session({ database: getActiveDatabase() })
+  try {
+    const result = await session.run(
+      `MATCH (a:\`${pattern.startLabel}\`)-[:\`${pattern.relType}\`]->(b:\`${pattern.endLabel}\`) ` +
+        `RETURN 1 AS ok LIMIT 1`
+    )
+    return result.records.length > 0
+  } finally {
+    await session.close()
+  }
+}
+
+/**
+ * How well a property would work as a prefix blocking key.
+ *
+ * Blocking compares a node only against others sharing its prefix, so the key
+ * has to divide the label into many small groups. A low-cardinality property
+ * does the opposite: `category` on a company register holds a handful of values,
+ * so every node's block is millions of nodes, every node hits the partner cap,
+ * and the partners are arbitrary nodes that happen to share a category.
+ *
+ * Measured on a 6.3M-node label blocked by `category`: one batch of 5,000 nodes
+ * produced 250,000 candidates and surfaced nothing, exhausting the pass's whole
+ * candidate budget on 0.08% of the label. Nothing errors — the queue is simply
+ * empty — which is why this is worth reporting before a run rather than after.
+ *
+ * Sampled rather than counted: an exact distinct-count over the label is a scan,
+ * and the ratio is obvious long before it is precise.
+ */
+export async function blockingKeyQuality(
+  label: string,
+  field: string,
+  prefixLength: number
+): Promise<{ sampled: number; distinctPrefixes: number; averageBlock: number }> {
+  const session = getDriver().session({ database: getActiveDatabase() })
+  try {
+    const result = await session.run(
+      `MATCH (n:\`${label}\`) WHERE n.\`${field}\` IS NOT NULL
+       RETURN n.\`${field}\` AS v LIMIT 5000`
+    )
+    const prefixes = new Set<string>()
+    let sampled = 0
+    for (const record of result.records) {
+      const value = record.get('v')
+      if (typeof value !== 'string') continue
+      sampled++
+      prefixes.add(value.slice(0, prefixLength))
+    }
+    const distinctPrefixes = prefixes.size
+    return {
+      sampled,
+      distinctPrefixes,
+      averageBlock: distinctPrefixes > 0 ? sampled / distinctPrefixes : 0,
+    }
+  } finally {
+    await session.close()
+  }
+}
+
+/**
+ * Run one query on a session of its own, so it can overlap with another.
+ *
+ * The driver serialises queries within a session; concurrency is per session,
+ * not per query.
+ */
+type QueryResult = Awaited<ReturnType<ReturnType<ReturnType<typeof getDriver>['session']>['run']>>
+
+async function runOnOwnSession(
+  driver: ReturnType<typeof getDriver>,
+  query: string
+): Promise<QueryResult> {
+  const session = driver.session({ database: getActiveDatabase() })
+  try {
+    return await session.run(query)
+  } finally {
+    await session.close()
+  }
 }

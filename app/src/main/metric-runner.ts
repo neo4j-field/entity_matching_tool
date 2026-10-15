@@ -1,6 +1,8 @@
+import { fieldKey } from '../shared/field-key'
+import { evaluateRule, ruleLeaves, ruleTree } from '../shared/surfacing-tree'
 import { createHash } from 'crypto'
 import { int } from 'neo4j-driver'
-import { getDriver } from './connection-service'
+import { getDriver, getActiveDatabase } from './connection-service'
 import { getCachedSchema } from './schema-service'
 import { pairIdFor } from './pair-id'
 import { getMetric } from './metrics/registry'
@@ -16,11 +18,23 @@ import type {
   PairEstimate,
   CandidateSummary,
   CaptureState,
+  NodeSnapshot,
+  PatternLeg,
+  RelatedNode,
 } from '../shared/types'
 import type { NodeRecord } from './metrics/types'
 
 // Element ids per snapshot re-fetch. The plan is a NodeByElementIdSeek, so this
 // is only about bounding one response.
+// Related nodes kept per primary node, per leg. Scoring compares every
+// combination, so this bounds a single pair's cost the way MAX_LIST_VALUES
+// bounds a list-valued property's.
+const MAX_RELATED_PER_NODE = 10
+
+// Pairs held in memory at once while writing them to SQLite. Bounds the peak
+// independently of how many candidates a run produced.
+const PAIR_WRITE_CHUNK = 20_000
+
 const SNAPSHOT_BATCH_SIZE = 10_000
 
 export type ProgressEvent = {
@@ -36,7 +50,7 @@ export async function runMetrics(
   signal: AbortSignal
 ): Promise<ScoreDistributions> {
   const driver = getDriver()
-  const neo4jSession = driver.session()
+  const neo4jSession = driver.session({ database: getActiveDatabase() })
 
   // Map pairId → accumulated scores
   const pairScores: PairScoreMap = new Map()
@@ -83,8 +97,15 @@ export async function runMetrics(
     for (const fieldConfig of session.fields) {
       for (const metricConfig of fieldConfig.metrics) {
         // Signal that this metric has started so the UI shows it at 0% immediately
-        onProgress({ metricId: metricConfig.metricId, fieldName: fieldConfig.propertyName, pct: 0, pairsAbove: 0 })
+        onProgress({ metricId: metricConfig.metricId, fieldName: fieldKey(fieldConfig), pct: 0, pairsAbove: 0 })
       }
+
+      // A related field never generates candidates. Bucketing on one would make
+      // two nodes candidates because they share a related node, which is the
+      // grouping this design rules out — fifty companies at one registered
+      // address are not fifty duplicates. densify() scores these per pair,
+      // against the pairs the primary label produced.
+      if (fieldConfig.legAlias) continue
 
       // Id and the one value this field needs, nothing else.
       //
@@ -112,7 +133,7 @@ export async function runMetrics(
       console.log(`[compute] ${nodes.length} nodes fetched for ${fieldConfig.propertyName} in ${Date.now() - tFetch}ms`)
       // The query above already filters to nodes that have the property, so this
       // is the exact set for which the field can be compared at all.
-      fieldNodeIds.set(fieldConfig.propertyName, new Set(nodes.map((n) => n.id)))
+      fieldNodeIds.set(fieldKey(fieldConfig), new Set(nodes.map((n) => n.id)))
 
       for (const metricConfig of fieldConfig.metrics) {
         if (signal.aborted) break
@@ -124,7 +145,7 @@ export async function runMetrics(
           rawScores = await metric.computePairScores(
             nodes,
             metricConfig.params,
-            (pct) => onProgress({ metricId: metricConfig.metricId, fieldName: fieldConfig.propertyName, pct, pairsAbove: 0 }),
+            (pct) => onProgress({ metricId: metricConfig.metricId, fieldName: fieldKey(fieldConfig), pct, pairsAbove: 0 }),
             signal
           )
         } catch (err) {
@@ -143,7 +164,7 @@ export async function runMetrics(
           if (!pairScores.has(pairId)) pairScores.set(pairId, { idA, idB, scores: [] })
           pairScores.get(pairId)!.scores.push({
             metricId: metricConfig.metricId,
-            fieldName: fieldConfig.propertyName,
+            fieldName: fieldKey(fieldConfig),
             score,
             aboveThreshold: score >= metricConfig.threshold,
           })
@@ -275,19 +296,32 @@ async function prefixBlockPairs(
   // The cursor is (value, elementId) rather than value alone, because a batch
   // boundary can fall inside a run of equal values and `n.f > $cursor` would
   // skip every node sharing the boundary value.
+  //
+  // Partners are limited inside a per-node subquery rather than by slicing a
+  // collect(). Collecting first and slicing after materialises every partner of
+  // every node in the batch on the server before throwing all but 50 away: on a
+  // dense block that is the whole block per node, 5,000 times over, and it blew
+  // a 278 MiB transaction limit in 1.1s at prefix length 2. The subquery stops
+  // reading at PREFIX_BLOCK_LIMIT rows.
+  //
+  // It ends in an aggregation, which is what keeps a node with no partners in
+  // the result: an aggregating subquery always returns exactly one row, where a
+  // plain MATCH would drop the node. A batch that returned nothing would leave
+  // the cursor unable to advance and end the walk early.
   const q =
     `MATCH (n:\`${label}\`) WHERE n.\`${field}\` IS NOT NULL\n` +
     `  AND ($cv IS NULL OR n.\`${field}\` > $cv\n` +
     `       OR (n.\`${field}\` = $cv AND elementId(n) > $cid))\n` +
     `WITH n ORDER BY n.\`${field}\`, elementId(n) LIMIT $batch\n` +
     `WITH n, left(n.\`${field}\`, ${prefix}) AS block\n` +
-    // OPTIONAL, so a node with no partners still returns a row. A plain MATCH
-    // drops them, and a batch where nothing matched would return nothing at all
-    // — leaving the cursor unable to advance and ending the walk early.
-    `OPTIONAL MATCH (m:\`${label}\`) WHERE m.\`${field}\` STARTS WITH block\n` +
-    `  AND (n.\`${field}\` < m.\`${field}\`\n` +
-    `       OR (n.\`${field}\` = m.\`${field}\` AND elementId(n) < elementId(m)))\n` +
-    `WITH n, [x IN collect(elementId(m)) WHERE x IS NOT NULL][..${PREFIX_BLOCK_LIMIT}] AS partners\n` +
+    `CALL {\n` +
+    `  WITH n, block\n` +
+    `  MATCH (m:\`${label}\`) WHERE m.\`${field}\` STARTS WITH block\n` +
+    `    AND (n.\`${field}\` < m.\`${field}\`\n` +
+    `         OR (n.\`${field}\` = m.\`${field}\` AND elementId(n) < elementId(m)))\n` +
+    `  WITH m LIMIT ${PREFIX_BLOCK_LIMIT}\n` +
+    `  RETURN collect(elementId(m)) AS partners\n` +
+    `}\n` +
     `RETURN elementId(n) AS id, n.\`${field}\` AS v, partners`
 
   // Resume where the last pass stopped. Pairs are produced only from the member
@@ -415,8 +449,9 @@ function captureFingerprint(session: Session): string {
         label: session.label,
         blockingField: session.blockingField,
         blockingPrefixLength: session.blockingPrefixLength,
+        legs: session.legs,
         fields: session.fields.map((f) => ({
-          name: f.propertyName,
+          name: fieldKey(f),
           metrics: f.metrics.map((mc) => ({ id: mc.metricId, params: mc.params })),
         })),
       })
@@ -432,7 +467,6 @@ async function capturePrefix(
   signal: AbortSignal
 ): Promise<ScoreDistributions> {
   const allScores: PairScoreMap = new Map()
-  const snapshotMap = new Map<string, NodeSnapshot>()
   let surfacedTotal = 0
   const fingerprint = captureFingerprint(session)
   // Resume only a walk that is both unfinished and made under this exact
@@ -463,7 +497,20 @@ async function capturePrefix(
       // Only the nodes in this batch's pairs, so memory tracks the batch.
       const involved = new Set<string>()
       for (const { idA, idB } of batchScores.values()) { involved.add(idA); involved.add(idB) }
-      await loadSnapshots(neo4jSession, involved, snapshotMap, signal)
+      // Scoped to the batch, and released with it.
+      //
+      // This map used to live outside the loop and accumulate every node the
+      // walk had ever touched. Nothing after the batch needs them — densify,
+      // field presence and the pair rows all read only this batch — but the
+      // walk kept them all, and a pattern leg multiplied the cost: each
+      // snapshot now carries up to MAX_RELATED_PER_NODE related nodes per leg.
+      // A long walk therefore climbed until V8 gave up, reported as
+      // "Ineffective mark-compacts near heap limit" at 3,578 of 4,000 MB.
+      //
+      // It was also quadratic in time: fieldPresence below scans the whole map
+      // once per batch, so a walk of n batches scanned O(n^2) snapshots.
+      const snapshotMap = new Map<string, NodeSnapshot>()
+      await loadSnapshots(neo4jSession, involved, snapshotMap, signal, session.legs ?? [])
       densify(session, batchScores, snapshotMap)
 
       const fields = fieldPresence(session, snapshotMap)
@@ -527,6 +574,15 @@ async function capturePrefix(
 }
 
 /** Which nodes carry each configured field, read from their snapshots. */
+// Whether a node carries anything comparable for a field: its own property, or
+// at least one related node with that property. Presence is per node; whether a
+// *pair* can be compared is decided in densify(), which also removes each node
+// from the other's related set.
+function hasFieldValue(snap: NodeSnapshot, fc: { propertyName: string; legAlias?: string }): boolean {
+  if (!fc.legAlias) return snap.properties[fc.propertyName] !== undefined
+  return (snap.related?.[fc.legAlias] ?? []).some((r) => r.properties[fc.propertyName] !== undefined)
+}
+
 function fieldPresence(
   session: Session,
   snapshots: Map<string, NodeSnapshot>
@@ -535,9 +591,9 @@ function fieldPresence(
   for (const fc of session.fields) {
     const ids = new Set<string>()
     for (const [id, snap] of snapshots) {
-      if (snap.properties[fc.propertyName] !== undefined) ids.add(id)
+      if (hasFieldValue(snap, fc)) ids.add(id)
     }
-    m.set(fc.propertyName, ids)
+    m.set(fieldKey(fc), ids)
   }
   return m
 }
@@ -563,24 +619,25 @@ async function scoreAndSurface(
   const involved = new Set<string>()
   for (const { idA, idB } of pairScores.values()) { involved.add(idA); involved.add(idB) }
   const tSnap = Date.now()
-  await loadSnapshots(neo4jSession, involved, snapshotMap, signal ?? new AbortController().signal)
+  await loadSnapshots(neo4jSession, involved, snapshotMap, signal ?? new AbortController().signal, session.legs ?? [])
   console.log(
     `[compute] snapshots: ${snapshotMap.size} of ${involved.size} nodes in ${Date.now() - tSnap}ms`
   )
 
-  const fields =
-    fieldNodeIds ??
-    (() => {
-      const m = new Map<string, Set<string>>()
-      for (const fc of session.fields) {
-        const ids = new Set<string>()
-        for (const [id, snap] of snapshotMap) {
-          if (snap.properties[fc.propertyName] !== undefined) ids.add(id)
-        }
-        m.set(fc.propertyName, ids)
-      }
-      return m
-    })()
+  // Presence for every field. The caller's map covers only the fields that went
+  // through candidate generation, and a related field never does — so without
+  // filling those in here they would look uncomparable to every pair, be
+  // skipped by All mode, and never reject anything. They were scored and then
+  // ignored: 281 pairs surfaced under an All rule whose related field scored 0.
+  const fields = fieldNodeIds ?? new Map<string, Set<string>>()
+  for (const fc of session.fields) {
+    if (fields.has(fieldKey(fc))) continue
+    const ids = new Set<string>()
+    for (const [id, snap] of snapshotMap) {
+      if (hasFieldValue(snap, fc)) ids.add(id)
+    }
+    fields.set(fieldKey(fc), ids)
+  }
 
   const tDense = Date.now()
   const densified = densify(session, pairScores, snapshotMap)
@@ -591,12 +648,29 @@ async function scoreAndSurface(
   // changed — including lowered — and re-applied against real candidates rather
   // than guessed at and rescanned. Only surfaced pairs carry node snapshots:
   // storing them for all would cost 116 MB per pass on Company against 12 MB.
-  const allPairs: CandidatePair[] = []
+  // Written in chunks rather than built as one array.
+  //
+  // This used to hold only the surfaced pairs — thousands — and became every
+  // candidate when unsurfaced ones started being kept for re-filtering. That is
+  // up to MAX_CANDIDATE_PAIRS objects alive at once, next to a pairScores map of
+  // the same size and the snapshots, and it is enough to exhaust V8's heap and
+  // take the app down: the crash lands in LowMemoryNotification with no error a
+  // user can act on. Only the chunk is retained now, so the peak does not grow
+  // with the candidate count.
   let surfacedCount = 0
+  let stored = 0
+  let chunk: CandidatePair[] = []
+  const flush = (): void => {
+    if (chunk.length === 0) return
+    upsertPairs(chunk)
+    stored += chunk.length
+    chunk = []
+  }
+  const tWrite = Date.now()
   for (const [pairId, { idA, idB, scores, abstained }] of pairScores) {
     const isSurfaced = surfaced(scores, session, idA, idB, fields, abstained)
     if (isSurfaced) surfacedCount++
-    allPairs.push({
+    chunk.push({
       id: pairId,
       sessionId: session.id,
       label: session.label,
@@ -606,16 +680,15 @@ async function scoreAndSurface(
       verdict: 'pending',
       surfaced: isSurfaced,
     })
+    if (chunk.length >= PAIR_WRITE_CHUNK) flush()
   }
+  flush()
   console.log(
-    `[compute] ${surfacedCount} pairs surfaced, ${allPairs.length - surfacedCount} kept for re-filtering`
+    `[compute] ${surfacedCount} pairs surfaced, ${stored - surfacedCount} kept for re-filtering ` +
+      `(written in chunks of ${PAIR_WRITE_CHUNK} in ${Date.now() - tWrite}ms)`
   )
 
-  let t = Date.now()
-  upsertPairs(allPairs)
-  console.log(`[compute] upsertPairs: ${Date.now() - t}ms`)
-
-  t = Date.now()
+  const t = Date.now()
   const dists = computeDistributions(pairScores)
   console.log(`[compute] computeDistributions: ${Date.now() - t}ms`)
 
@@ -627,7 +700,8 @@ export async function loadSnapshots(
   neo4jSession: ReturnType<ReturnType<typeof getDriver>['session']>,
   ids: Set<string>,
   into: Map<string, NodeSnapshot>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  legs: PatternLeg[] = []
 ): Promise<void> {
   const all = [...ids]
   for (let i = 0; i < all.length; i += SNAPSHOT_BATCH_SIZE) {
@@ -643,6 +717,63 @@ export async function loadSnapshots(
       for (const [k, v] of Object.entries(raw)) properties[k] = sanitize(v)
       into.set(r.get('id') as string, { id: r.get('id') as string, properties })
     }
+    for (const leg of legs) {
+      if (signal.aborted) return
+      await loadLeg(neo4jSession, batch, leg, into)
+    }
+  }
+}
+
+/**
+ * Attach one leg's related nodes to the snapshots of a batch of primary nodes.
+ *
+ * Capped per node, for the same reason MAX_LIST_VALUES caps a list-valued
+ * property: scoring compares every combination, so an unbounded fan-out would
+ * cost |a| x |b| comparisons on a single pair.
+ */
+async function loadLeg(
+  neo4jSession: ReturnType<ReturnType<typeof getDriver>['session']>,
+  batch: string[],
+  leg: PatternLeg,
+  into: Map<string, NodeSnapshot>
+): Promise<void> {
+  const arrow = leg.direction === 'out' ? '-[:`REL`]->' : '<-[:`REL`]-'
+  const pattern = arrow.replace('REL', leg.relType)
+  // Limited per node, inside the subquery.
+  //
+  // This was `WITH n, m LIMIT $cap` over the whole batch, which is a global cap,
+  // not a per-node one: nodes appearing early in the result consumed the entire
+  // budget and every later node in the batch returned no row at all. Their
+  // snapshot never got a `related` section, so the leg's fields read as
+  // unjudgeable for every pair involving them — no values shown in review, and
+  // no scores. Same mistake as collecting a whole block before slicing it in the
+  // prefix walk.
+  //
+  // The subquery ends in an aggregation so a node with genuinely no related
+  // nodes still returns a row, with an empty list. That distinguishes "has none"
+  // from "was never asked".
+  const result = await neo4jSession.run(
+    `MATCH (n) WHERE elementId(n) IN $ids
+     CALL {
+       WITH n
+       MATCH (n)${pattern}(m:\`${leg.label}\`)
+       WITH m LIMIT ${MAX_RELATED_PER_NODE}
+       RETURN collect({ id: elementId(m), props: properties(m) }) AS related
+     }
+     RETURN elementId(n) AS id, related`,
+    { ids: batch }
+  )
+  for (const r of result.records) {
+    const snap = into.get(r.get('id') as string)
+    if (!snap) continue
+    const nodes: RelatedNode[] = []
+    for (const entry of (r.get('related') ?? []) as { id: string; props: Record<string, unknown> }[]) {
+      const properties: Record<string, unknown> = {}
+      for (const [k, v] of Object.entries(entry.props ?? {})) properties[k] = sanitize(v)
+      nodes.push({ id: entry.id, properties })
+    }
+    if (!snap.related) snap.related = {}
+    snap.related[leg.alias] = nodes
   }
 }
 
@@ -654,9 +785,9 @@ function surfaced(
   fieldNodeIds: Map<string, Set<string>>,
   abstained?: Set<string>
 ): boolean {
-  return applySurfacingRule(scores, session, (propertyName) => {
-    if (abstained?.has(propertyName)) return false
-    const ids = fieldNodeIds.get(propertyName)
+  return applySurfacingRule(scores, session, (key) => {
+    if (abstained?.has(key)) return false
+    const ids = fieldNodeIds.get(key)
     return ids !== undefined && ids.has(idA) && ids.has(idB)
   })
 }
@@ -674,63 +805,18 @@ function surfaced(
 export function applySurfacingRule(
   scores: MetricScore[],
   session: Session,
-  comparable: (propertyName: string) => boolean
+  comparable: (fieldKeyOf: string) => boolean
 ): boolean {
-  const { mode, fields } = session.surfacingRule
-
   // Field score = max across metrics for that field
   const fieldScores = new Map<string, number>()
   for (const score of scores) {
     const current = fieldScores.get(score.fieldName) ?? 0
     fieldScores.set(score.fieldName, Math.max(current, score.score))
   }
-
-  if (mode === 'any') {
-    for (const fc of fields) {
-      const fs = fieldScores.get(fc.propertyName) ?? 0
-      if (fs >= fc.threshold) return true
-    }
-    return false
-  }
-
-  if (mode === 'all') {
-    // Every field the pair can actually be compared on must meet its threshold.
-    // Fields one or both nodes lack are skipped rather than counted as a
-    // failure — otherwise sparse data excludes pairs that match on everything
-    // they share. A field both nodes have but that produced no score is still a
-    // failure: that is a real comparison the pair lost.
-    let compared = 0
-    for (const fc of fields) {
-      if (!comparable(fc.propertyName)) continue
-      compared++
-      if ((fieldScores.get(fc.propertyName) ?? 0) < fc.threshold) return false
-    }
-    return compared > 0
-  }
-
-  // weighted-average — divide by the weights actually in play so this is a mean
-  // rather than a sum. Weights drift away from summing to 1 whenever a field is
-  // removed or a slider is dragged, and an unnormalized sum silently rescales
-  // the combined threshold: five fields left holding 1/9 each cap the total at
-  // 0.56, so a 0.85 threshold can never be met however well the pair matches.
-  // A field that cannot be judged is dropped from both sides of the ratio, so it
-  // neither helps nor hurts. Leaving it only in the denominator would penalise a
-  // pair for a comparison nothing was willing to make.
-  //
-  // This now covers a field one of the nodes does not carry, which previously
-  // averaged in as a zero and so counted absent data as a mismatch. 'all' mode
-  // already skipped those for exactly the reason stated above, and the two modes
-  // disagreeing on what "cannot be judged" means is what made a re-filter unable
-  // to reproduce compute's own verdict.
-  const usable = fields.filter((fc) => comparable(fc.propertyName))
-  const totalWeight = usable.reduce((sum, fc) => sum + fc.weight, 0)
-  if (totalWeight <= 0) return false
-  const weighted = usable.reduce((sum, fc) => {
-    return sum + fc.weight * (fieldScores.get(fc.propertyName) ?? 0)
-  }, 0)
-  return weighted / totalWeight >= (session.surfacingRule.combinedThreshold ?? 0.85)
+  // Unjudgeable is not the same as false, so the walk returns three values and
+  // only TRUE surfaces a pair.
+  return evaluateRule(ruleTree(session.surfacingRule), fieldScores, comparable) === true
 }
-
 
 function percentile(sorted: number[], p: number): number {
   const idx = Math.ceil(p * sorted.length) - 1
@@ -775,7 +861,9 @@ function computeDistributions(
 
 type PairEntry = { idA: string; idB: string; scores: MetricScore[]; abstained?: Set<string> }
 type PairScoreMap = Map<string, PairEntry>
-type NodeSnapshot = { id: string; properties: Record<string, unknown> }
+// NodeSnapshot was declared here as a local structural duplicate of the shared
+// type. It matched by accident rather than by definition, so a field added to
+// the real one — `related` — was invisible to every use in this file.
 
 // Fills in the scores candidate generation never produced, for every field the
 // two nodes both carry. Returns how many it added.
@@ -788,42 +876,83 @@ function densify(session: Session, pairScores: PairScoreMap, snapshots: Map<stri
   let densified = 0
   for (const entry of pairScores.values()) {
     const { idA, idB, scores } = entry
-    const propsA = snapshots.get(idA)?.properties
-    const propsB = snapshots.get(idB)?.properties
-    if (!propsA || !propsB) continue
+    const snapA = snapshots.get(idA)
+    const snapB = snapshots.get(idB)
+    if (!snapA || !snapB) continue
+    const propsA = snapA.properties
+    const propsB = snapB.properties
     const have = new Set(scores.map((s) => `${s.fieldName}|${s.metricId}`))
     const scoredFields = new Set(scores.map((s) => s.fieldName))
 
     for (const fieldConfig of session.fields) {
+      // A related field's value is the list its leg reaches, which is where
+      // every related score is produced: candidate generation never sees these
+      // fields, because bucketing on them would make two nodes candidates for
+      // sharing a related node — the grouping this design rules out.
+      const a = fieldConfig.legAlias
+        ? relatedValues(snapA, fieldConfig.legAlias, fieldConfig.propertyName, idB)
+        : propsA[fieldConfig.propertyName]
+      const b = fieldConfig.legAlias
+        ? relatedValues(snapB, fieldConfig.legAlias, fieldConfig.propertyName, idA)
+        : propsB[fieldConfig.propertyName]
       // properties() omits nulls, so absence here means the node genuinely
-      // lacks the property and there is nothing to compare.
-      const a = propsA[fieldConfig.propertyName]
-      const b = propsB[fieldConfig.propertyName]
+      // lacks the property and there is nothing to compare. An empty related
+      // list means the same: a comparison that was never possible.
       if (a === undefined || b === undefined) continue
+      if (Array.isArray(a) && a.length === 0) continue
+      if (Array.isArray(b) && b.length === 0) continue
 
       for (const metricConfig of fieldConfig.metrics) {
-        if (have.has(`${fieldConfig.propertyName}|${metricConfig.metricId}`)) continue
+        if (have.has(`${fieldKey(fieldConfig)}|${metricConfig.metricId}`)) continue
         const metric = getMetric(metricConfig.metricId)
         if (!metric.scorePair) continue
         const score = metric.scorePair(a, b, metricConfig.params)
         if (score === null) continue
         scores.push({
           metricId: metricConfig.metricId,
-          fieldName: fieldConfig.propertyName,
+          fieldName: fieldKey(fieldConfig),
           score,
           aboveThreshold: score >= metricConfig.threshold,
         })
-        scoredFields.add(fieldConfig.propertyName)
+        scoredFields.add(fieldKey(fieldConfig))
         densified++
       }
 
-      if (!scoredFields.has(fieldConfig.propertyName)) {
+      if (!scoredFields.has(fieldKey(fieldConfig))) {
         if (!entry.abstained) entry.abstained = new Set()
-        entry.abstained.add(fieldConfig.propertyName)
+        entry.abstained.add(fieldKey(fieldConfig))
       }
     }
   }
   return densified
+}
+
+/**
+ * One leg's values for a node, with the pair's counterpart removed.
+ *
+ * If A's related set contains B, comparing the two on that leg is circular —
+ * the pair scores well because it is linked, not because the two are
+ * independently alike. The exclusion has to happen here rather than at fetch
+ * time: a node's related set is loaded once and reused across every pair it
+ * appears in, so who to exclude is only known per pair.
+ *
+ * Two nodes both linked to some third node is different, and stays: that is
+ * ordinary shared evidence.
+ */
+function relatedValues(
+  snap: NodeSnapshot,
+  alias: string,
+  propertyName: string,
+  counterpartId: string
+): unknown[] {
+  const nodes = snap.related?.[alias] ?? []
+  const out: unknown[] = []
+  for (const rel of nodes) {
+    if (rel.id === counterpartId) continue
+    const v = rel.properties[propertyName]
+    if (v !== undefined) out.push(v)
+  }
+  return out
 }
 
 // Above this many candidate pairs the estimate thins the node set before scoring.
@@ -895,7 +1024,7 @@ async function estimatePrefixPass(
   const involved = new Set<string>()
   for (const { idA, idB } of batchScores.values()) { involved.add(idA); involved.add(idB) }
   const snapshots = new Map<string, NodeSnapshot>()
-  await loadSnapshots(neo4jSession, involved, snapshots, signal)
+  await loadSnapshots(neo4jSession, involved, snapshots, signal, session.legs ?? [])
   densify(session, batchScores, snapshots)
   const fields = fieldPresence(session, snapshots)
 
@@ -931,7 +1060,7 @@ async function estimatePrefixPass(
 
 export async function estimateSurfacedPairs(session: Session): Promise<PairEstimate> {
   const driver = getDriver()
-  const neo4jSession = driver.session()
+  const neo4jSession = driver.session({ database: getActiveDatabase() })
   try {
     // Size the label first — a count-store lookup, independent of label size —
     // so the fetch below can be bounded rather than discovered to be too large
@@ -964,6 +1093,20 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
     })
     if (fetched.length < 2) return { count: 0, exact: true, candidates: 0 }
 
+    // Attach the legs to the sample. Without this a session with related fields
+    // estimates as though it had none: every related field would look absent,
+    // abstain, and drop out of the rule.
+    if (session.legs?.length) {
+      const byId = new Map(fetched.map((n) => [n.id, n]))
+      const tLegs = Date.now()
+      await loadSnapshots(neo4jSession, new Set(byId.keys()), byId, new AbortController().signal, session.legs)
+      // loadSnapshots replaces each map entry with a fresh object rather than
+      // mutating the one passed in, so the array still points at the leg-less
+      // originals until they are swapped back.
+      for (let i = 0; i < fetched.length; i++) fetched[i] = byId.get(fetched[i].id) ?? fetched[i]
+      console.log(`[estimate] legs attached to ${byId.size} sampled nodes in ${Date.now() - tLegs}ms`)
+    }
+
     console.log(`[estimate] ${session.label}: ${totalNodes} nodes, fetched ${fetched.length}`)
     let t = Date.now()
     const candidates = countCandidates(session, fetched)
@@ -979,7 +1122,7 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
 
     console.log(`[estimate] scoring ${sample.length} nodes across ${session.fields.length} fields`)
     t = Date.now()
-    const count = await surfacedCount(session, sample)
+    const { count, leafSupport } = await surfacedCount(session, sample)
     console.log(`[estimate] surfacedCount: ${count} in ${Date.now() - t}ms`)
     // Exact only when every node in the label was scored — both the fetch bound
     // and the candidate thinning have to have been no-ops.
@@ -997,7 +1140,7 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
     const projectedCandidates = Math.round(candidates * (totalNodes / fetched.length))
 
     if (sample.length === totalNodes) {
-      return { count, exact: true, candidates, projectedCandidates: candidates }
+      return { count, exact: true, candidates, projectedCandidates: candidates, leafSupport }
     }
 
     const scale = pairCount(totalNodes) / pairCount(sample.length)
@@ -1011,6 +1154,7 @@ export async function estimateSurfacedPairs(session: Session): Promise<PairEstim
       // and nothing else in the result reveals it.
       observed: count,
       projectedCandidates,
+      leafSupport,
     }
   } finally {
     neo4jSession.close().catch(() => {})
@@ -1025,6 +1169,10 @@ function countCandidates(session: Session, nodes: NodeSnapshot[]): number {
   let widest = 0
 
   for (const fieldConfig of session.fields) {
+    // Related fields produce no candidates — they are scored per pair against
+    // the pairs the primary label generated — so counting them here would
+    // report a candidate set compute never builds.
+    if (fieldConfig.legAlias) continue
     const present = nodes.filter((n) => n.properties[fieldConfig.propertyName] !== undefined)
     if (present.length < 2) continue
 
@@ -1058,16 +1206,22 @@ function countCandidates(session: Session, nodes: NodeSnapshot[]): number {
   return widest
 }
 
-async function surfacedCount(session: Session, nodes: NodeSnapshot[]): Promise<number> {
+async function surfacedCount(
+  session: Session,
+  nodes: NodeSnapshot[]
+): Promise<{ count: number; leafSupport: PairEstimate['leafSupport'] }> {
   const snapshots = new Map(nodes.map((n) => [n.id, n]))
   const fieldNodeIds = new Map<string, Set<string>>()
   const pairScores: PairScoreMap = new Map()
   const signal = new AbortController().signal
 
   for (const fieldConfig of session.fields) {
-    const present = nodes.filter((n) => n.properties[fieldConfig.propertyName] !== undefined)
-    fieldNodeIds.set(fieldConfig.propertyName, new Set(present.map((n) => n.id)))
+    const present = nodes.filter((n) => hasFieldValue(n, fieldConfig))
+    fieldNodeIds.set(fieldKey(fieldConfig), new Set(present.map((n) => n.id)))
     if (present.length < 2) continue
+    // Mirrors the real run: a related field never reaches computePairScores,
+    // and densify() below scores it per pair.
+    if (fieldConfig.legAlias) continue
 
     const records: NodeRecord[] = present.map((n) => ({
       id: n.id,
@@ -1083,7 +1237,7 @@ async function surfacedCount(session: Session, nodes: NodeSnapshot[]): Promise<n
         if (!pairScores.has(pairId)) pairScores.set(pairId, { idA, idB, scores: [] })
         pairScores.get(pairId)!.scores.push({
           metricId: metricConfig.metricId,
-          fieldName: fieldConfig.propertyName,
+          fieldName: fieldKey(fieldConfig),
           score,
           aboveThreshold: score >= metricConfig.threshold,
         })
@@ -1093,11 +1247,26 @@ async function surfacedCount(session: Session, nodes: NodeSnapshot[]): Promise<n
 
   densify(session, pairScores, snapshots)
 
+  // Tally each leaf alongside the verdict, so an empty result can say which
+  // branch was responsible instead of only that there was none.
+  const leaves = ruleLeaves(ruleTree(session.surfacingRule))
+  const tally = new Map(leaves.map((l) => [`${l.key}|${l.threshold}`, { ...l, judged: 0, passed: 0 }]))
+
   let count = 0
   for (const { idA, idB, scores, abstained } of pairScores.values()) {
     if (surfaced(scores, session, idA, idB, fieldNodeIds, abstained)) count++
+
+    const best = new Map<string, number>()
+    for (const sc of scores) best.set(sc.fieldName, Math.max(best.get(sc.fieldName) ?? 0, sc.score))
+    for (const entry of tally.values()) {
+      const ids = fieldNodeIds.get(entry.key)
+      const judgeable = !abstained?.has(entry.key) && ids !== undefined && ids.has(idA) && ids.has(idB)
+      if (!judgeable) continue
+      entry.judged++
+      if ((best.get(entry.key) ?? 0) >= entry.threshold) entry.passed++
+    }
   }
-  return count
+  return { count, leafSupport: [...tally.values()] }
 }
 
 // Evenly spaced rather than random, so clicking Recalculate twice on unchanged

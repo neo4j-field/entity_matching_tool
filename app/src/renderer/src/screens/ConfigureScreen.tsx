@@ -1,5 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, type ReactElement } from 'react'
 import { useStore } from '../store'
+import { fieldKey } from '../../../shared/field-key'
+import { describeRule, ruleFieldKeys, ruleTree } from '../../../shared/surfacing-tree'
 import { METRICS, suggestMetrics, getMetricDef } from '../lib/metrics'
 import { formatUsd, summarizeTokens } from '../lib/usage'
 import { MAX_CANDIDATE_PAIRS } from '../../../shared/constants'
@@ -10,6 +12,8 @@ import type {
   SurfacingRule,
   LlmCallRecord,
   PropertyKind,
+  PatternLeg,
+  RuleNode,
   PairEstimate,
   BlockingStrategy,
 } from '../../../shared/types'
@@ -24,9 +28,19 @@ interface DraftMetric {
 
 interface DraftField {
   propertyName: string
+  // Absent for a property of the primary label; otherwise the leg it came from.
+  legAlias?: string
   enabled: boolean
   metrics: DraftMetric[]
   kind: string
+}
+
+// A leg the user has added, with whether the database actually has data for it.
+// db.schema.visualization() reports label-pair combinations rather than only
+// observed ones, so roughly one in eight matches nothing — configuring one of
+// those produces a session that surfaces no pairs and reports no error.
+interface DraftLeg extends PatternLeg {
+  status: 'checking' | 'live' | 'empty'
 }
 
 const SKIP_KINDS = ['boolean']
@@ -56,16 +70,213 @@ function roundSampled(n: number, observed: number | undefined): string {
   return (Math.round(n / mag) * mag).toLocaleString()
 }
 
+
+// ── Rule editor ───────────────────────────────────────────────────────────────
+
+interface RuleEditorProps {
+  node: RuleNode
+  options: { key: string; propertyName: string; legAlias?: string }[]
+  onChange: (next: RuleNode) => void
+  onRemove?: () => void
+  depth?: number
+}
+
+function newLeaf(options: RuleEditorProps['options']): RuleNode {
+  const first = options[0]
+  return {
+    kind: 'field',
+    propertyName: first?.propertyName ?? '',
+    legAlias: first?.legAlias,
+    threshold: 0.85,
+  }
+}
+
+function RuleEditor({ node, options, onChange, onRemove, depth = 0 }: RuleEditorProps): ReactElement {
+  if (node.kind === 'field') {
+    const known = options.some((o) => o.key === fieldKey(node))
+    return (
+      <div className="flex items-center gap-2 py-1">
+        <select
+          value={fieldKey(node)}
+          onChange={(e) => {
+            const opt = options.find((o) => o.key === e.target.value)
+            if (opt) onChange({ ...node, propertyName: opt.propertyName, legAlias: opt.legAlias })
+          }}
+          className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200"
+        >
+          {!known && <option value={fieldKey(node)}>{fieldKey(node)} (not compared)</option>}
+          {options.map((o) => <option key={o.key} value={o.key}>{o.key}</option>)}
+        </select>
+        <span className="text-gray-500 text-xs">≥</span>
+        <input
+          type="number" min={0} max={1} step={0.01} value={node.threshold}
+          onChange={(e) => onChange({ ...node, threshold: Number(e.target.value) })}
+          className="w-20 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200"
+        />
+        {/* A leaf naming a field with no enabled metric never receives a score,
+            so it is unjudgeable for every pair and the rule silently surfaces
+            nothing. The rule editor and the field editor are separate screens,
+            which is what makes this easy to do by accident. */}
+        {/* Without this a pair that cannot be judged on the field is ignored
+            here and decided on the rest of the group. With it, the pair fails —
+            "both records must carry this". */}
+        <button
+          onClick={() => onChange({ ...node, required: !node.required })}
+          title="Fail the pair when either record lacks this field, instead of ignoring the condition"
+          className={`text-xs px-1.5 py-0.5 rounded border ${
+            node.required
+              ? 'bg-sky-950 border-sky-700 text-sky-300'
+              : 'bg-gray-900 border-gray-700 text-gray-500 hover:text-gray-300'
+          }`}
+        >
+          both required
+        </button>
+        {!known && <span className="text-amber-400 text-xs">⚠ this field is not being compared</span>}
+        {onRemove && <button onClick={onRemove} className="text-gray-600 hover:text-gray-300 text-xs">×</button>}
+      </div>
+    )
+  }
+
+  if (node.kind === 'weighted') {
+    return (
+      <div className="border border-gray-800 rounded-lg px-3 py-2 space-y-1 bg-gray-950/50">
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-sky-300 font-medium">Weighted average</span>
+          <span className="text-gray-500">≥</span>
+          <input
+            type="number" min={0} max={1} step={0.01} value={node.threshold}
+            onChange={(e) => onChange({ ...node, threshold: Number(e.target.value) })}
+            className="w-20 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200"
+          />
+          <div className="flex-1" />
+          {/* Same failure as an empty group: nothing to average is unjudgeable,
+              so the node can never be true. */}
+          {node.children.length === 0 && <span className="text-amber-400 text-xs">⚠ empty — nothing can satisfy this</span>}
+          {onRemove && <button onClick={onRemove} className="text-gray-600 hover:text-gray-300 text-xs">×</button>}
+        </div>
+        {node.children.map((c, i) => (
+          <div key={`${fieldKey(c)}-${i}`} className="flex items-center gap-2 pl-3 py-0.5">
+            <span className="text-xs text-gray-300 font-mono">{fieldKey(c)}</span>
+            <span className="text-gray-600 text-xs">weight</span>
+            <input
+              type="number" min={0} step={0.05} value={c.weight}
+              onChange={(e) => {
+                const children = [...node.children]
+                children[i] = { ...c, weight: Number(e.target.value) }
+                onChange({ ...node, children })
+              }}
+              className="w-20 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200"
+            />
+            <button
+              onClick={() => {
+                const children = [...node.children]
+                children[i] = { ...c, required: !c.required }
+                onChange({ ...node, children })
+              }}
+              title="Fail the whole weighted average when either record lacks this field"
+              className={`text-xs px-1.5 py-0.5 rounded border ${
+                c.required
+                  ? 'bg-sky-950 border-sky-700 text-sky-300'
+                  : 'bg-gray-900 border-gray-700 text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              both required
+            </button>
+            <button
+              onClick={() => onChange({ ...node, children: node.children.filter((_, j) => j !== i) })}
+              className="text-gray-600 hover:text-gray-300 text-xs"
+            >×</button>
+          </div>
+        ))}
+        <button
+          onClick={() => {
+            const first = options[0]
+            if (!first) return
+            onChange({ ...node, children: [...node.children, { propertyName: first.propertyName, legAlias: first.legAlias, weight: 0.5 }] })
+          }}
+          className="text-xs text-gray-500 hover:text-gray-300 pl-3"
+        >+ field</button>
+      </div>
+    )
+  }
+
+  const setChild = (i: number, next: RuleNode): void => {
+    const children = [...node.children]
+    children[i] = next
+    onChange({ ...node, children })
+  }
+
+  return (
+    <div className={`rounded-lg border px-3 py-2 space-y-1 ${depth % 2 === 0 ? 'border-gray-800 bg-gray-950/40' : 'border-gray-700 bg-gray-900/40'}`}>
+      <div className="flex items-center gap-2">
+        <div className="flex rounded overflow-hidden border border-gray-700">
+          {(['and', 'or'] as const).map((op) => (
+            <button
+              key={op}
+              onClick={() => onChange({ ...node, op })}
+              className={`px-2 py-0.5 text-xs ${node.op === op ? 'bg-emerald-900 text-emerald-300' : 'bg-gray-900 text-gray-500 hover:text-gray-300'}`}
+            >
+              {op === 'and' ? 'ALL of' : 'ANY of'}
+            </button>
+          ))}
+        </div>
+        <div className="flex-1" />
+        {/* A group with nothing in it is unjudgeable, so it can never be true. */}
+        {node.children.length === 0 && <span className="text-amber-400 text-xs">⚠ empty — nothing can satisfy this</span>}
+        {onRemove && <button onClick={onRemove} className="text-gray-600 hover:text-gray-300 text-xs">×</button>}
+      </div>
+
+      <div className="pl-3 space-y-1">
+        {node.children.map((child, i) => (
+          <RuleEditor
+            key={i}
+            node={child}
+            options={options}
+            depth={depth + 1}
+            onChange={(next) => setChild(i, next)}
+            onRemove={() => onChange({ ...node, children: node.children.filter((_, j) => j !== i) })}
+          />
+        ))}
+        <div className="flex gap-2 pt-0.5">
+          <button
+            onClick={() => onChange({ ...node, children: [...node.children, newLeaf(options)] })}
+            className="text-xs text-gray-500 hover:text-gray-300"
+          >+ field</button>
+          <button
+            onClick={() => onChange({ ...node, children: [...node.children, { kind: 'group', op: 'and', children: [] }] })}
+            className="text-xs text-gray-500 hover:text-gray-300"
+          >+ group</button>
+          <button
+            onClick={() => onChange({ ...node, children: [...node.children, { kind: 'weighted', threshold: 0.85, children: [] }] })}
+            className="text-xs text-gray-500 hover:text-gray-300"
+          >+ weighted average</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function ConfigureScreen() {
   const { schema, connection, session, settings, setSession, setScreen, setPairs, setDistributions, addToast } = useStore()
   const [step, setStep] = useState<Step>('label')
   const [selectedLabel, setSelectedLabel] = useState<LabelMeta | null>(null)
   const [fields, setFields] = useState<DraftField[]>([])
-  const [surfacingMode, setSurfacingMode] = useState<'any' | 'all' | 'weighted-average'>('any')
-  const [fieldSurfacing, setFieldSurfacing] = useState<Record<string, { threshold: number; weight: number }>>({})
+  const [legs, setLegs] = useState<DraftLeg[]>([])
+  const [surfacingMode, setSurfacingMode] = useState<'any' | 'all' | 'weighted-average' | 'custom'>('any')
+  // Only set in 'custom'. The three named modes stay as they were, and are what
+  // a session stores unless someone builds an expression.
+  const [ruleNode, setRuleNode] = useState<RuleNode | null>(null)
+  const [fieldSurfacing, setFieldSurfacing] = useState<
+    Record<string, { threshold: number; weight: number; required?: boolean }>
+  >({})
   const [combinedThreshold, setCombinedThreshold] = useState(0.85)
   const [blocking, setBlocking] = useState<BlockingStrategy>('auto')
   const [blockingField, setBlockingField] = useState<string>('')
+  // Tagged with what it was measured for, so a stale reading is never shown
+  // against a different key — and so the effect never clears it synchronously.
+  const [blockingQuality, setBlockingQuality] = useState<
+    { field: string; prefixLength: number; sampled: number; distinctPrefixes: number; averageBlock: number } | null
+  >(null)
   const [prefixLength, setPrefixLength] = useState(8)
   const [estimate, setEstimate] = useState<PairEstimate | null>(null)
   const [estimating, setEstimating] = useState(false)
@@ -82,6 +293,23 @@ export default function ConfigureScreen() {
 
   // A prefix predicate has to touch the raw property, so it needs an index that
   // supports a range seek. Anything else means a full label scan per node.
+  // A blocking key only works if it splits the label into many small groups.
+  // Checked whenever the key or length changes, because picking a
+  // low-cardinality one fails silently: the run does not error, it produces an
+  // empty queue after burning its whole candidate budget on a fraction of the
+  // label.
+  useEffect(() => {
+    if (blocking !== 'prefix' || !selectedLabel) return
+    const field = blockingField || seekable[0]?.name
+    if (!field) return
+    let cancelled = false
+    window.api.schema
+      .blockingQuality(selectedLabel.name, field, prefixLength)
+      .then((q) => { if (!cancelled) setBlockingQuality({ field, prefixLength, ...q }) })
+      .catch(() => undefined)
+    return () => { cancelled = true }
+  }, [blocking, blockingField, prefixLength, selectedLabel])
+
   const seekable = (selectedLabel?.properties ?? []).filter((p) =>
     p.indexes?.some((k) => k === 'RANGE' || k === 'TEXT')
   )
@@ -122,9 +350,14 @@ export default function ConfigureScreen() {
 
     // Show every comparable property, not just the ones the session kept —
     // otherwise a field deselected on an earlier pass can never be selected again.
-    const saved = new Map(session!.fields.map((fc) => [fc.propertyName, fc]))
+    // Restore the pattern first: a saved related field has to find its leg.
+    const savedLegs: DraftLeg[] = (session!.legs ?? []).map((l) => ({ ...l, status: 'live' }))
+    setLegs(savedLegs)
+
+    const saved = new Map(session!.fields.map((fc) => [fieldKey(fc), fc]))
     const fromSaved = (fc: FieldConfig, kind: PropertyKind): DraftField => ({
       propertyName: fc.propertyName,
+      legAlias: fc.legAlias,
       enabled: true,
       kind,
       metrics: fc.metrics.map((m) => ({ metricId: m.metricId, params: { ...m.params }, threshold: m.threshold })),
@@ -148,21 +381,44 @@ export default function ConfigureScreen() {
         }
       })
 
+    // Every property of each saved leg, so a related field deselected on an
+    // earlier pass can be selected again — the same reason the primary label
+    // lists all of its properties rather than only the kept ones.
+    for (const leg of savedLegs) {
+      const legLabel = schema?.labels.find((l) => l.name === leg.label)
+      for (const prop of legLabel?.properties ?? []) {
+        if (SKIP_KINDS.includes(prop.inferredKind)) continue
+        const key = `${leg.alias}.${prop.name}`
+        const fc = saved.get(key)
+        if (fc) { draft.push(fromSaved(fc, prop.inferredKind)); continue }
+        const suggested = suggestMetrics(prop.inferredKind)
+        draft.push({
+          propertyName: prop.name, legAlias: leg.alias, enabled: false, kind: prop.inferredKind,
+          metrics: suggested.map((m) => ({ metricId: m.id, params: { ...m.defaultParams }, threshold: m.defaultThreshold })),
+        })
+      }
+    }
+
     // A saved field the schema no longer reports still has verdicts riding on it.
     for (const fc of session!.fields) {
-      if (!draft.some((d) => d.propertyName === fc.propertyName)) draft.push(fromSaved(fc, 'name'))
+      if (!draft.some((d) => fieldKey(d) === fieldKey(fc))) draft.push(fromSaved(fc, 'name'))
     }
     setFields(draft)
 
-    const sf: Record<string, { threshold: number; weight: number }> = {}
+    const sf: Record<string, { threshold: number; weight: number; required?: boolean }> = {}
     for (const f of session!.surfacingRule.fields) {
-      sf[f.propertyName] = { threshold: f.threshold, weight: f.weight ?? (1 / session!.surfacingRule.fields.length) }
+      sf[fieldKey(f)] = { threshold: f.threshold, weight: f.weight ?? (1 / session!.surfacingRule.fields.length), required: f.required }
     }
     setFieldSurfacing(sf)
     setBlocking(session!.blockingStrategy ?? 'auto')
     setBlockingField(session!.blockingField ?? '')
     setPrefixLength(session!.blockingPrefixLength ?? 8)
-    setSurfacingMode(session!.surfacingRule.mode)
+    if (session!.surfacingRule.tree) {
+      setRuleNode(session!.surfacingRule.tree)
+      setSurfacingMode('custom')
+    } else {
+      setSurfacingMode(session!.surfacingRule.mode)
+    }
     if (session!.surfacingRule.combinedThreshold != null) {
       setCombinedThreshold(session!.surfacingRule.combinedThreshold)
     }
@@ -194,21 +450,83 @@ export default function ConfigureScreen() {
       })
     setFields(draft)
     // Initialize surfacing per-field configs
-    const sf: Record<string, { threshold: number; weight: number }> = {}
+    const sf: Record<string, { threshold: number; weight: number; required?: boolean }> = {}
     for (const f of draft) {
-      sf[f.propertyName] = { threshold: 0.8, weight: 1 / Math.max(draft.length, 1) }
+      sf[fieldKey(f)] = { threshold: 0.8, weight: 1 / Math.max(draft.length, 1) }
     }
     setFieldSurfacing(sf)
     setStep('fields')
   }
 
-  function toggleField(name: string) {
-    setFields((prev) => prev.map((f) => f.propertyName === name ? { ...f, enabled: !f.enabled } : f))
+  // Legs available from the primary label, in either direction. Both ends are
+  // offered because the useful relationship is as often incoming — an Address
+  // that companies point at, an Officer who points at companies.
+  const availableLegs = (schema?.relPatterns ?? []).flatMap((pat) => {
+    const out: { relType: string; direction: 'out' | 'in'; label: string }[] = []
+    if (pat.startLabel === selectedLabel?.name) out.push({ relType: pat.relType, direction: 'out', label: pat.endLabel })
+    if (pat.endLabel === selectedLabel?.name) out.push({ relType: pat.relType, direction: 'in', label: pat.startLabel })
+    return out
+  }).filter((cand) => !legs.some((l) =>
+    l.relType === cand.relType && l.direction === cand.direction && l.label === cand.label
+  ))
+
+  // The alias namespaces this leg's field keys and is stored in every score row,
+  // so it has to be unique and stable. Derived from the label rather than typed,
+  // to keep it out of the user's hands once anything is scored.
+  function aliasFor(label: string): string {
+    const base = label.charAt(0).toLowerCase() + label.slice(1)
+    if (!legs.some((l) => l.alias === base)) return base
+    let n = 2
+    while (legs.some((l) => l.alias === `${base}${n}`)) n++
+    return `${base}${n}`
+  }
+
+  async function addLeg(cand: { relType: string; direction: 'out' | 'in'; label: string }): Promise<void> {
+    const leg: DraftLeg = { ...cand, alias: aliasFor(cand.label), status: 'checking' }
+    setLegs((prev) => [...prev, leg])
+
+    const labelMeta = schema?.labels.find((l) => l.name === cand.label)
+    setFields((prev) => [
+      ...prev,
+      ...(labelMeta?.properties ?? [])
+        .filter((prop) => !SKIP_KINDS.includes(prop.inferredKind))
+        .map((prop) => {
+          const suggested = suggestMetrics(prop.inferredKind)
+          return {
+            propertyName: prop.name,
+            legAlias: leg.alias,
+            enabled: false,
+            kind: prop.inferredKind,
+            metrics: suggested.map((m) => ({
+              metricId: m.id, params: { ...m.defaultParams }, threshold: m.defaultThreshold,
+            })),
+          }
+        }),
+    ])
+
+    const startLabel = cand.direction === 'out' ? selectedLabel!.name : cand.label
+    const endLabel = cand.direction === 'out' ? cand.label : selectedLabel!.name
+    let live = false
+    try {
+      live = await window.api.schema.validatePattern({ relType: cand.relType, startLabel, endLabel })
+    } catch {
+      live = false
+    }
+    setLegs((prev) => prev.map((l) => (l.alias === leg.alias ? { ...l, status: live ? 'live' : 'empty' } : l)))
+  }
+
+  function removeLeg(alias: string): void {
+    setLegs((prev) => prev.filter((l) => l.alias !== alias))
+    setFields((prev) => prev.filter((f) => f.legAlias !== alias))
+  }
+
+  function toggleField(key: string) {
+    setFields((prev) => prev.map((f) => fieldKey(f) === key ? { ...f, enabled: !f.enabled } : f))
   }
 
   function toggleMetric(fieldName: string, metricId: string) {
     setFields((prev) => prev.map((f) => {
-      if (f.propertyName !== fieldName) return f
+      if (fieldKey(f) !== fieldName) return f
       const hasIt = f.metrics.some((m) => m.metricId === metricId)
       if (hasIt) {
         return { ...f, metrics: f.metrics.filter((m) => m.metricId !== metricId) }
@@ -221,7 +539,7 @@ export default function ConfigureScreen() {
 
   function setMetricParam(fieldName: string, metricId: string, key: string, value: unknown) {
     setFields((prev) => prev.map((f) => {
-      if (f.propertyName !== fieldName) return f
+      if (fieldKey(f) !== fieldName) return f
       return {
         ...f,
         metrics: f.metrics.map((m) => m.metricId === metricId ? { ...m, params: { ...m.params, [key]: value } } : m),
@@ -231,7 +549,7 @@ export default function ConfigureScreen() {
 
   function setMetricThreshold(fieldName: string, metricId: string, threshold: number) {
     setFields((prev) => prev.map((f) => {
-      if (f.propertyName !== fieldName) return f
+      if (fieldKey(f) !== fieldName) return f
       return {
         ...f,
         metrics: f.metrics.map((m) => m.metricId === metricId ? { ...m, threshold } : m),
@@ -249,11 +567,12 @@ export default function ConfigureScreen() {
     // their relative sizes. Carrying stale weights forward is what let a session
     // end up with five fields at 1/9 each, whose total could never reach the
     // combined threshold.
-    const priorTotal = enabled.reduce((sum, f) => sum + (fieldSurfacing[f.propertyName]?.weight ?? 0), 0)
-    const sf: Record<string, { threshold: number; weight: number }> = {}
+    const priorTotal = enabled.reduce((sum, f) => sum + (fieldSurfacing[fieldKey(f)]?.weight ?? 0), 0)
+    const sf: Record<string, { threshold: number; weight: number; required?: boolean }> = {}
     for (const f of enabled) {
-      const cfg = fieldSurfacing[f.propertyName]
-      sf[f.propertyName] = {
+      const cfg = fieldSurfacing[fieldKey(f)]
+      sf[fieldKey(f)] = {
+        required: cfg?.required,
         threshold: cfg?.threshold ?? 0.8,
         weight: cfg && priorTotal > 0 ? cfg.weight / priorTotal : 1 / enabled.length,
       }
@@ -285,19 +604,25 @@ export default function ConfigureScreen() {
     const enabledFields = fields.filter((f) => f.enabled && f.metrics.length > 0)
     const fieldConfigs: FieldConfig[] = enabledFields.map((f) => ({
       propertyName: f.propertyName,
+      legAlias: f.legAlias,
       metrics: f.metrics as MetricConfig[],
     }))
 
     const sfFields = enabledFields.map((f) => ({
       propertyName: f.propertyName,
-      threshold: fieldSurfacing[f.propertyName]?.threshold ?? 0.8,
-      weight: fieldSurfacing[f.propertyName]?.weight ?? (1 / enabledFields.length),
+      legAlias: f.legAlias,
+      threshold: fieldSurfacing[fieldKey(f)]?.threshold ?? 0.8,
+      weight: fieldSurfacing[fieldKey(f)]?.weight ?? (1 / enabledFields.length),
+      required: fieldSurfacing[fieldKey(f)]?.required,
     }))
 
     const surfacingRule: SurfacingRule = {
-      mode: surfacingMode,
+      // mode and fields stay populated even for a custom rule: they are what an
+      // older build, and ruleTree(), fall back to when no tree is present.
+      mode: surfacingMode === 'custom' ? 'all' : surfacingMode,
       fields: sfFields,
       combinedThreshold: surfacingMode === 'weighted-average' ? combinedThreshold : undefined,
+      tree: surfacingMode === 'custom' && ruleNode ? ruleNode : undefined,
     }
 
     return {
@@ -308,6 +633,11 @@ export default function ConfigureScreen() {
       blockingStrategy: blocking,
       blockingField: blocking === 'prefix' ? blockingField || seekable[0]?.name : undefined,
       blockingPrefixLength: blocking === 'prefix' ? prefixLength : undefined,
+      // Only legs with data. A leg the schema offers but the graph has nothing
+      // for would contribute no scores and no error.
+      legs: legs.filter((l) => l.status === 'live').map(({ alias, relType, direction, label }) => ({
+        alias, relType, direction, label,
+      })),
       status: 'configuring' as const,
       reviewCursor: 0,
       reviewFilter: { verdict: 'all' as const },
@@ -331,9 +661,14 @@ export default function ConfigureScreen() {
 
       const reasonMap: Record<string, string> = {}
       setFields((prev) => prev.map((f) => {
+        // The suggestion was made about the primary label's properties, so it
+        // must not reach a related field that happens to share a name — that
+        // would enable it and replace its metrics on advice about a different
+        // label.
+        if (f.legAlias) return f
         const s = suggestion.fields.find((sf) => sf.propertyName === f.propertyName)
         if (!s) return f
-        reasonMap[f.propertyName] = s.reason
+        reasonMap[fieldKey(f)] = s.reason
         return {
           ...f,
           enabled: s.enabled,
@@ -394,7 +729,13 @@ export default function ConfigureScreen() {
     setCreating(true)
     try {
       let activeSession
-      if (isRerun && session) {
+      // Update whenever we already hold a session, not only when it has been
+      // reviewed. A session is created before compute runs, so a compute that
+      // fails leaves one behind in 'configuring' with no pairs — and pressing
+      // Start Compute again used to create another. Four failed attempts made
+      // four identical sessions. Starting genuinely fresh clears the store
+      // first (newSession), so a session here is always the one being edited.
+      if (session) {
         // Update the existing session in-place — preserves all pair verdicts
         const partial = buildSessionPartial()
         activeSession = {
@@ -404,6 +745,7 @@ export default function ConfigureScreen() {
           blockingStrategy: partial.blockingStrategy,
           blockingField: partial.blockingField,
           blockingPrefixLength: partial.blockingPrefixLength,
+          legs: partial.legs,
           updatedAt: new Date().toISOString(),
         }
         await window.api.session.save(activeSession)
@@ -551,6 +893,72 @@ export default function ConfigureScreen() {
               </div>
             )}
 
+            {/* Related nodes. Fields from one hop away join the same rule; only
+                the primary label ever merges. */}
+            <div className="bg-gray-900 rounded-xl border border-gray-800 px-5 py-4 space-y-3">
+              <div>
+                <p className="text-sm font-medium text-white">Related nodes</p>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  Compare on properties one hop away as well — an address, a ticker, a parent
+                  company. Only {selectedLabel.name} nodes are ever merged; related nodes supply
+                  values to compare and nothing else.
+                </p>
+              </div>
+
+              {legs.map((leg) => (
+                <div key={leg.alias} className="flex items-center gap-2 text-xs bg-gray-950 border border-gray-800 rounded-lg px-3 py-2">
+                  <span className="font-mono text-gray-300">
+                    ({selectedLabel.name}){leg.direction === 'out' ? '-' : '<-'}[:{leg.relType}]{leg.direction === 'out' ? '->' : '-'}({leg.label})
+                  </span>
+                  <span className="text-gray-600">as</span>
+                  <span className="text-sky-300">{leg.alias}</span>
+                  {leg.status === 'checking' && <span className="text-gray-500">checking…</span>}
+                  {leg.status === 'live' && <span className="text-emerald-400">✓ has data</span>}
+                  {leg.status === 'empty' && (
+                    <span className="text-amber-400" title="The schema reports this shape but no nodes are connected this way, so it would contribute nothing">
+                      ⚠ no data — will be ignored
+                    </span>
+                  )}
+                  <div className="flex-1" />
+                  <button onClick={() => removeLeg(leg.alias)} className="text-gray-500 hover:text-gray-300">remove</button>
+                </div>
+              ))}
+
+              {/* Multi-labelled nodes make one relationship look like several
+                  legs: on a test database PREVIOUSLY_NAMED->Company and
+                  PREVIOUSLY_NAMED->PreviousName are the same 647,358 edges,
+                  because every PreviousName node is also a Company. Selecting
+                  both counts one piece of evidence twice, which matters most
+                  under a weighted average. */}
+              {legs.some((a, i) => legs.some((b, j) => i < j && a.relType === b.relType && a.direction === b.direction)) && (
+                <p className="text-xs text-amber-400">
+                  ⚠ Two legs use the same relationship in the same direction. If the labels overlap —
+                  nodes carrying both — these reach the same nodes, and their fields would count the
+                  same evidence twice.
+                </p>
+              )}
+
+              {availableLegs.length > 0 ? (
+                <div className="flex flex-wrap gap-1.5">
+                  {availableLegs.map((cand) => (
+                    <button
+                      key={`${cand.relType}|${cand.direction}|${cand.label}`}
+                      onClick={() => addLeg(cand)}
+                      className="text-xs font-mono px-2 py-1 rounded border border-gray-700 text-gray-400 hover:text-white hover:border-gray-500"
+                    >
+                      + {cand.direction === 'out' ? '' : '←'}{cand.relType} ({cand.label})
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-xs text-gray-600">
+                  {legs.length > 0
+                    ? 'No further relationships available from this label.'
+                    : 'The schema reports no relationships from this label.'}
+                </p>
+              )}
+            </div>
+
             {fields.length === 0 && (
               <div className="bg-gray-900 rounded-xl border border-gray-800 px-6 py-8 text-center space-y-2">
                 <p className="text-white font-medium">No comparable properties found</p>
@@ -563,33 +971,42 @@ export default function ConfigureScreen() {
             )}
 
             {fields.map((field) => {
-              const propMeta = selectedLabel.properties.find((p) => p.name === field.propertyName)
+              // A related field's property metadata lives on its own label.
+              const ownerLabel = field.legAlias
+                ? schema?.labels.find((l) => l.name === legs.find((g) => g.alias === field.legAlias)?.label)
+                : selectedLabel
+              const propMeta = ownerLabel?.properties.find((p) => p.name === field.propertyName)
               // For properties whose kind couldn't be determined, fall back to name-applicable metrics
               const applicableMetrics = METRICS.filter((m) =>
                 m.applicableTo.includes((field.kind === 'other' ? 'name' : field.kind) as never)
               )
               return (
-                <div key={field.propertyName} className={`bg-gray-900 rounded-xl border transition-colors ${field.enabled ? 'border-gray-700' : 'border-gray-800 opacity-60'}`}>
+                <div key={fieldKey(field)} className={`bg-gray-900 rounded-xl border transition-colors ${field.enabled ? 'border-gray-700' : 'border-gray-800 opacity-60'}`}>
                   <div className="flex items-center gap-3 px-5 py-4">
                     <input
                       type="checkbox"
                       checked={field.enabled}
-                      onChange={() => toggleField(field.propertyName)}
+                      onChange={() => toggleField(fieldKey(field))}
                       className="w-4 h-4 accent-emerald-500"
                     />
                     <div className="flex-1">
                       <div className="flex items-center gap-2">
+                        {field.legAlias && (
+                          <span className="text-xs px-1.5 py-0.5 bg-sky-950 border border-sky-800 rounded text-sky-300">
+                            {legs.find((g) => g.alias === field.legAlias)?.label ?? field.legAlias}
+                          </span>
+                        )}
                         <span className="font-medium text-white">{field.propertyName}</span>
                         <span className="text-xs px-1.5 py-0.5 bg-gray-800 rounded text-gray-400">{field.kind}</span>
                         {propMeta?.mandatory && (
                           <span className="text-xs px-1.5 py-0.5 bg-amber-900 rounded text-amber-300">required</span>
                         )}
-                        {aiReasons[field.propertyName] && (
+                        {aiReasons[fieldKey(field)] && (
                           <span className="text-xs px-1.5 py-0.5 bg-indigo-950 border border-indigo-800 rounded text-indigo-400">✦ AI</span>
                         )}
                       </div>
-                      {aiReasons[field.propertyName] ? (
-                        <div className="text-xs text-indigo-400 mt-0.5">{aiReasons[field.propertyName]}</div>
+                      {aiReasons[fieldKey(field)] ? (
+                        <div className="text-xs text-indigo-400 mt-0.5">{aiReasons[fieldKey(field)]}</div>
                       ) : propMeta?.sampleValues && propMeta.sampleValues.length > 0 ? (
                         <div className="text-xs text-gray-600 mt-0.5 truncate">
                           e.g. {propMeta.sampleValues.slice(0, 3).map(String).join(', ')}
@@ -607,7 +1024,7 @@ export default function ConfigureScreen() {
                           return (
                             <button
                               key={m.id}
-                              onClick={() => toggleMetric(field.propertyName, m.id)}
+                              onClick={() => toggleMetric(fieldKey(field), m.id)}
                               className={`px-3 py-1 rounded-full text-xs font-medium border transition-colors ${
                                 active
                                   ? 'bg-emerald-900 border-emerald-700 text-emerald-300'
@@ -628,7 +1045,7 @@ export default function ConfigureScreen() {
                       {field.metrics.map((fm) => {
                         const def = getMetricDef(fm.metricId)
                         if (!def) return null
-                        const key = `${field.propertyName}:${fm.metricId}`
+                        const key = `${fieldKey(field)}:${fm.metricId}`
                         const expanded = expandedMetric === key
                         return (
                           <div key={fm.metricId} className="bg-gray-950 rounded-lg p-3 space-y-2">
@@ -642,7 +1059,7 @@ export default function ConfigureScreen() {
                                   max={1}
                                   step={0.01}
                                   value={fm.threshold}
-                                  onChange={(e) => setMetricThreshold(field.propertyName, fm.metricId, parseFloat(e.target.value))}
+                                  onChange={(e) => setMetricThreshold(fieldKey(field), fm.metricId, parseFloat(e.target.value))}
                                   className="w-16 bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-xs text-white"
                                 />
                               </label>
@@ -663,7 +1080,7 @@ export default function ConfigureScreen() {
                                     {pdef.type === 'select' ? (
                                       <select
                                         value={String(fm.params[pkey] ?? '')}
-                                        onChange={(e) => setMetricParam(field.propertyName, fm.metricId, pkey, e.target.value)}
+                                        onChange={(e) => setMetricParam(fieldKey(field), fm.metricId, pkey, e.target.value)}
                                         className="bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-xs text-white"
                                       >
                                         {pdef.options?.map((o) => <option key={o} value={o}>{o}</option>)}
@@ -675,14 +1092,14 @@ export default function ConfigureScreen() {
                                         max={pdef.max}
                                         step={pdef.step}
                                         value={Number(fm.params[pkey] ?? 0)}
-                                        onChange={(e) => setMetricParam(field.propertyName, fm.metricId, pkey, parseFloat(e.target.value))}
+                                        onChange={(e) => setMetricParam(fieldKey(field), fm.metricId, pkey, parseFloat(e.target.value))}
                                         className="w-20 bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-xs text-white"
                                       />
                                     ) : (
                                       <input
                                         type="text"
                                         value={String(fm.params[pkey] ?? '')}
-                                        onChange={(e) => setMetricParam(field.propertyName, fm.metricId, pkey, e.target.value)}
+                                        onChange={(e) => setMetricParam(fieldKey(field), fm.metricId, pkey, e.target.value)}
                                         className="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-xs text-white"
                                       />
                                     )}
@@ -726,22 +1143,123 @@ export default function ConfigureScreen() {
 
             {/* Mode selector */}
             <div className="flex gap-2">
-              {(['any', 'all', 'weighted-average'] as const).map((mode) => (
+              {(['any', 'all', 'weighted-average', 'custom'] as const).map((mode) => (
                 <button
                   key={mode}
-                  onClick={() => setSurfacingMode(mode)}
+                  onClick={() => {
+                    // Seed the expression from the mode on screen, so switching
+                    // to Custom starts from the rule you already had rather than
+                    // from nothing. The three modes are exact special cases.
+                    if (mode === 'custom' && !ruleNode) {
+                      setRuleNode(ruleTree({
+                        mode: surfacingMode === 'custom' ? 'all' : surfacingMode,
+                        fields: fields
+                          .filter((f) => f.enabled && f.metrics.length > 0)
+                          .map((f) => ({
+                            propertyName: f.propertyName,
+                            legAlias: f.legAlias,
+                            threshold: fieldSurfacing[fieldKey(f)]?.threshold ?? 0.8,
+                            weight: fieldSurfacing[fieldKey(f)]?.weight ?? 0.5,
+                            required: fieldSurfacing[fieldKey(f)]?.required,
+                          })),
+                        combinedThreshold,
+                      }))
+                    }
+                    setSurfacingMode(mode)
+                  }}
                   className={`px-4 py-2 rounded-lg text-sm font-medium border transition-colors ${
                     surfacingMode === mode
                       ? 'bg-emerald-900 border-emerald-700 text-emerald-300'
                       : 'bg-gray-900 border-gray-700 text-gray-400 hover:border-gray-600'
                   }`}
                 >
-                  {mode === 'any' ? 'Any field' : mode === 'all' ? 'All fields' : 'Weighted average'}
+                  {mode === 'any' ? 'Any field'
+                    : mode === 'all' ? 'All fields'
+                    : mode === 'weighted-average' ? 'Weighted average'
+                    : 'Custom rule'}
                 </button>
               ))}
             </div>
 
-            <div className="text-xs text-gray-500 space-y-1.5">
+            {surfacingMode === 'custom' && ruleNode && (
+              <div className="space-y-2">
+                <RuleEditor
+                  node={ruleNode}
+                  options={fields
+                    .filter((f) => f.enabled && f.metrics.length > 0)
+                    .map((f) => ({ key: fieldKey(f), propertyName: f.propertyName, legAlias: f.legAlias }))}
+                  onChange={setRuleNode}
+                />
+                <p className="text-xs text-gray-500 font-mono bg-gray-950 border border-gray-800 rounded px-3 py-2">
+                  {describeRule(ruleNode)}
+                </p>
+                {/* Which leaf is responsible when a rule surfaces nothing. The
+                    two causes need opposite fixes: nothing judged means the
+                    field is not being compared or its leg has no data; judged
+                    but never passed means the threshold is too strict here. */}
+                {estimate?.leafSupport && estimate.leafSupport.length > 0 && (
+                  <div className="bg-gray-950 border border-gray-800 rounded px-3 py-2 space-y-1">
+                    <p className="text-xs text-gray-400">
+                      In the sample just estimated, each condition of this rule:
+                    </p>
+                    {estimate.leafSupport.map((l) => (
+                      <div key={`${l.key}|${l.threshold}`} className="flex items-center gap-2 text-xs font-mono">
+                        <span className="text-gray-300 w-56 truncate">{l.key} ≥ {l.threshold.toFixed(2)}</span>
+                        {l.judged === 0 ? (
+                          <span className="text-amber-400">never judged — this field is not compared, or its leg has no data</span>
+                        ) : l.passed === 0 ? (
+                          <span className="text-amber-400">
+                            judged {l.judged.toLocaleString()}×, passed 0 — nothing reaches this threshold
+                          </span>
+                        ) : (
+                          <span className="text-gray-500">
+                            judged {l.judged.toLocaleString()}×, passed {l.passed.toLocaleString()}×
+                            {' '}({((l.passed / l.judged) * 100).toFixed(1)}%)
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                    <p className="text-[11px] text-gray-600 pt-0.5">
+                      A condition every pair fails makes any ALL group containing it impossible. An
+                      exact match on a field that identifies a node — a company number, a URI — can
+                      never be true of two different nodes.
+                    </p>
+                  </div>
+                )}
+
+                <p className="text-xs text-gray-600">
+                  A field neither node carries cannot be judged, so it is left out and the group is
+                  decided on the rest — a group with nothing judged surfaces nothing. This is what
+                  All fields already does; the expression just makes it explicit.
+                </p>
+                {/* Under the named modes every enabled field was in the rule, so
+                    these could not diverge. They can now, and an unreferenced
+                    field is not inert: candidate generation is the union across
+                    every enabled field. Measured on a 244-node label, adding one
+                    unreferenced field took the candidate set from 5,744 to
+                    28,817 and surfaced one extra pair — a pair that became a
+                    candidate only through that field and then passed the rule. */}
+                {(() => {
+                  const used = new Set(ruleFieldKeys(ruleNode))
+                  const unused = fields
+                    .filter((f) => f.enabled && f.metrics.length > 0 && !used.has(fieldKey(f)))
+                    .map((f) => fieldKey(f))
+                  if (unused.length === 0) return null
+                  return (
+                    <p className="text-xs text-amber-400/90">
+                      ⚠ {unused.length} compared field{unused.length === 1 ? '' : 's'} not used by this
+                      rule: <span className="font-mono">{unused.join(', ')}</span>. They do not decide
+                      whether a pair surfaces, but they are still scored, still shown in review, and
+                      still widen the set of pairs considered — so they can bring in pairs the rule
+                      then accepts. Deselect them on{' '}
+                      <span className="text-gray-300">Fields &amp; Metrics</span> to narrow the search.
+                    </p>
+                  )
+                })()}
+              </div>
+            )}
+
+            <div className={`text-xs text-gray-500 space-y-1.5 ${surfacingMode === 'custom' ? 'hidden' : ''}`}>
               <p>
                 A field&apos;s score is its{' '}
                 <span className="text-gray-300">best-scoring metric</span> — if any one metric you
@@ -798,12 +1316,29 @@ export default function ConfigureScreen() {
               )}
             </div>
 
-            {/* Per-field thresholds / weights */}
-            <div className="space-y-3">
+            {/* Per-field thresholds / weights. A custom rule carries its own
+                thresholds on each leaf, so these would be editable and ignored. */}
+            <div className={`space-y-3 ${surfacingMode === 'custom' ? 'hidden' : ''}`}>
               {Object.entries(fieldSurfacing).map(([name, cfg]) => (
                 <div key={name} className="bg-gray-900 rounded-xl border border-gray-800 px-5 py-4">
                   <div className="flex items-center gap-4">
                     <span className="font-medium text-white text-sm flex-1">{name}</span>
+                    <button
+                      onClick={() =>
+                        setFieldSurfacing((prev) => ({
+                          ...prev,
+                          [name]: { ...prev[name], required: !prev[name]?.required },
+                        }))
+                      }
+                      title="Fail the pair when either record lacks this field, instead of ignoring it"
+                      className={`text-xs px-1.5 py-0.5 rounded border ${
+                        cfg.required
+                          ? 'bg-sky-950 border-sky-700 text-sky-300'
+                          : 'bg-gray-900 border-gray-700 text-gray-500 hover:text-gray-300'
+                      }`}
+                    >
+                      both required
+                    </button>
                     {surfacingMode !== 'weighted-average' && (
                       <label className="flex items-center gap-2 text-xs text-gray-400">
                         Threshold
@@ -936,6 +1471,34 @@ export default function ConfigureScreen() {
                     Case-sensitive, because the lookup reads the property as stored — a value
                     beginning &ldquo;AC&rdquo; is not found by a search for &ldquo;ac&rdquo;.
                   </p>
+                  {/* Measured on this label: a key whose values collapse to a few
+                      prefixes puts every node in one enormous block, so every
+                      node hits the 50-partner cap and its partners are arbitrary
+                      nodes that merely share the value. Blocking Company by
+                      `category` produced 250,000 candidates and surfaced nothing
+                      from 0.08% of the label, with no error anywhere. */}
+                  {blockingQuality &&
+                    blockingQuality.sampled > 0 &&
+                    blockingQuality.field === (blockingField || seekable[0].name) &&
+                    blockingQuality.prefixLength === prefixLength && (
+                    blockingQuality.averageBlock > 20 ? (
+                      <p className="text-xs text-amber-400">
+                        ⚠ Poor blocking key: {blockingQuality.sampled.toLocaleString()} sampled values
+                        share only {blockingQuality.distinctPrefixes.toLocaleString()} distinct
+                        {' '}{prefixLength}-character prefixes — about{' '}
+                        {Math.round(blockingQuality.averageBlock).toLocaleString()} nodes per block.
+                        Every node will be compared against an arbitrary handful of the block, most
+                        pairs will be unrelated, and the queue is likely to come back empty. Choose a
+                        key with many distinct values, such as a name or an address line.
+                      </p>
+                    ) : (
+                      <p className="text-xs text-gray-600">
+                        {blockingQuality.sampled.toLocaleString()} sampled values give{' '}
+                        {blockingQuality.distinctPrefixes.toLocaleString()} distinct prefixes — about{' '}
+                        {blockingQuality.averageBlock.toFixed(1)} nodes per block.
+                      </p>
+                    )
+                  )}
                 </div>
               )}
 

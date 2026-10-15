@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto'
-import { getDriver } from './connection-service'
+import { getDriver, getActiveDatabase } from './connection-service'
 import { getDb } from './db'
 import { listPairs, loadSession } from './session-service'
 import { writeAuditRecord as writeNeo4jAuditRecord } from './neo4j-storage'
@@ -48,7 +48,7 @@ export async function buildMergeGroups(sessionId: string): Promise<MergeGroup[]>
   }
 
   const driver = getDriver()
-  const session = driver.session()
+  const session = driver.session({ database: getActiveDatabase() })
   const groups: MergeGroup[] = []
 
   try {
@@ -139,7 +139,7 @@ async function mergeWithApoc(
   groupIds: string[],
   strategy: string
 ): Promise<string | null> {
-  const session = driver.session()
+  const session = driver.session({ database: getActiveDatabase() })
   try {
     const result = await session.run(
       `MATCH (n) WHERE elementId(n) IN $ids
@@ -160,7 +160,7 @@ async function mergeWithFallback(
   groupIds: string[],
   strategy: string
 ): Promise<string | null> {
-  const session = driver.session()
+  const session = driver.session({ database: getActiveDatabase() })
   const tx = session.beginTransaction()
   try {
     // 1. Select survivor

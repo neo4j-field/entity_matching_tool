@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useStore } from '../store'
+import { fieldKey } from '../../../shared/field-key'
 import ScoreHistogram from '../components/ScoreHistogram'
 import type { ScoreDistributions, Session } from '../../../shared/types'
 
@@ -43,7 +44,7 @@ export default function ComputeScreen() {
         const init: Record<string, number> = {}
         for (const f of session.fields) {
           for (const m of f.metrics) {
-            init[`${f.propertyName}:${m.metricId}`] = m.threshold
+            init[`${fieldKey(f)}:${m.metricId}`] = m.threshold
           }
         }
         setThresholds(init)
@@ -78,7 +79,7 @@ export default function ComputeScreen() {
         ...f,
         metrics: f.metrics.map((m) => ({
           ...m,
-          threshold: thresholds[`${f.propertyName}:${m.metricId}`] ?? m.threshold,
+          threshold: thresholds[`${fieldKey(f)}:${m.metricId}`] ?? m.threshold,
         })),
       })),
     }

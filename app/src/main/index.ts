@@ -1,8 +1,10 @@
 import { app, shell, BrowserWindow, ipcMain } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
+import appIcon from '../../resources/icon.png?asset'
 import { IPC } from '../shared/ipc-channels'
 import { refilterPairs } from './refilter-service'
+import { fieldKey } from '../shared/field-key'
 import * as connection from './connection-service'
 import * as schema from './schema-service'
 import * as sessions from './session-service'
@@ -29,6 +31,8 @@ import type {
   ClassifyPlan,
   JobEstimate,
   LlmJobKind,
+  RelPattern,
+  NodeSnapshot,
 } from '../shared/types'
 
 let mainWindow: BrowserWindow | null = null
@@ -40,6 +44,9 @@ function createWindow(): void {
     height: 900,
     show: false,
     autoHideMenuBar: true,
+    // macOS and Windows take the icon from the packaged bundle; Linux reads it
+    // from the window, which is what resources/icon.png is for.
+    ...(process.platform === 'linux' ? { icon: appIcon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
@@ -293,6 +300,16 @@ function registerIpc() {
 
   // Schema
   ipcMain.handle(IPC.SCHEMA_DISCOVER, () => schema.discoverSchema())
+  ipcMain.handle(
+    IPC.SCHEMA_BLOCKING_QUALITY,
+    async (_, label: string, field: string, prefixLength: number) =>
+      schema.blockingKeyQuality(label, field, prefixLength)
+  )
+  // A pattern the schema reports may still match nothing — visualization()
+  // returns label-pair combinations, not only observed ones.
+  ipcMain.handle(IPC.SCHEMA_VALIDATE_PATTERN, async (_, pattern: RelPattern) =>
+    schema.relPatternHasData(pattern)
+  )
   ipcMain.handle(IPC.SCHEMA_ESTIMATE_PAIRS, async (_, sessionId: string) => {
     const session = sessions.loadSession(sessionId)
     if (!session) return { count: 0, exact: true, candidates: 0 }
@@ -367,8 +384,18 @@ function registerIpc() {
     // scores with nothing to read them against — and on a label with no `name`
     // it carried nothing identifying at all, because the display fallback below
     // only ever knew a handful of property names.
-    const matchedFields = sessions.loadSession(sessionId)?.fields.map((f) => f.propertyName) ?? []
-    const fieldColumns = matchedFields.flatMap((f) => [`node_a_${f}`, `node_b_${f}`])
+    const matchedFields = sessions.loadSession(sessionId)?.fields ?? []
+    const fieldColumns = matchedFields.flatMap((f) => [`node_a_${fieldKey(f)}`, `node_b_${fieldKey(f)}`])
+    // A related field's value is the list its leg reaches, so it is joined into
+    // one cell rather than given a column per related node.
+    const valueOf = (snap: NodeSnapshot, f: { propertyName: string; legAlias?: string }): string => {
+      if (!f.legAlias) return snap.properties[f.propertyName] == null ? '' : String(snap.properties[f.propertyName])
+      return (snap.related?.[f.legAlias] ?? [])
+        .map((r) => r.properties[f.propertyName])
+        .filter((v) => v != null)
+        .map(String)
+        .join(', ')
+    }
     const header = [
       'pair_id', 'node_a_id', 'node_a_display', 'node_b_id', 'node_b_display',
       'verdict', 'decided_at', 'note', ...fieldColumns, ...allMetricKeys,
@@ -380,19 +407,18 @@ function registerIpc() {
       const known = props.name ?? props.title ?? props.heading ?? props.summary ?? props.text
       if (known != null) return String(known)
       for (const f of matchedFields) {
-        if (props[f] != null) return String(props[f])
+        if (!f.legAlias && props[f.propertyName] != null) return String(props[f.propertyName])
       }
       const firstString = Object.values(props).find((v) => typeof v === 'string' && v.length > 0)
       return firstString === undefined ? '' : String(firstString)
     }
-    const cell = (v: unknown): string => (v == null ? '' : String(v))
     const rows = filtered.map((p) => {
       const scoreMap = Object.fromEntries(p.scores.map((s) => [`${s.metricId}_${s.fieldName}`, s.score]))
       return [
         p.id, p.nodeA.id, displayVal(p.nodeA.properties),
         p.nodeB.id, displayVal(p.nodeB.properties),
         p.verdict, p.decidedAt ?? '', p.note ?? '',
-        ...matchedFields.flatMap((f) => [cell(p.nodeA.properties[f]), cell(p.nodeB.properties[f])]),
+        ...matchedFields.flatMap((f) => [valueOf(p.nodeA, f), valueOf(p.nodeB, f)]),
         ...allMetricKeys.map((k) => scoreMap[k] ?? ''),
       ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')
     })
@@ -458,7 +484,7 @@ function registerIpc() {
   // Node detail
   ipcMain.handle(IPC.NODE_NEIGHBORS, async (_, nodeId: string) => {
     const driver = connection.getDriver()
-    const neo4jSession = driver.session()
+    const neo4jSession = driver.session({ database: connection.getActiveDatabase() })
     try {
       const result = await neo4jSession.run(
         `MATCH (n) WHERE elementId(n) = $id
@@ -491,7 +517,7 @@ function registerIpc() {
 
   ipcMain.handle(IPC.NODE_SOURCE_PASSAGES, async (_, nodeId: string) => {
     const driver = connection.getDriver()
-    const neo4jSession = driver.session()
+    const neo4jSession = driver.session({ database: connection.getActiveDatabase() })
     try {
       const result = await neo4jSession.run(
         `MATCH (n) WHERE elementId(n) = $id

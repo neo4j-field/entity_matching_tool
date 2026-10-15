@@ -1,7 +1,8 @@
 import { getDb } from './db'
-import { getDriver } from './connection-service'
+import { getDriver, getActiveDatabase } from './connection-service'
 import { applySurfacingRule, loadSnapshots } from './metric-runner'
-import type { MetricScore, NodeSnapshot, RefilterResult, Session } from '../shared/types'
+import { fieldKey } from '../shared/field-key'
+import type { MetricScore, NodeSnapshot, PatternLeg, RefilterResult, Session } from '../shared/types'
 
 /**
  * Re-apply the surfacing rule to candidates already captured.
@@ -45,9 +46,16 @@ export async function refilterPairs(session: Session, signal?: AbortSignal): Pro
   // Current per-metric thresholds, for the aboveThreshold flag the review screen
   // colours by. Recomputed here because it is threshold-dependent and so goes
   // stale the moment a threshold moves.
+  //
+  // Held as a list rather than only as a joined-key map, because splitting the
+  // key back apart would break the moment a field key contains the separator.
+  const thresholdList: { fieldName: string; metricId: string; threshold: number }[] = []
   const thresholds = new Map<string, number>()
   for (const f of session.fields) {
-    for (const m of f.metrics) thresholds.set(`${f.propertyName}|${m.metricId}`, m.threshold)
+    for (const m of f.metrics) {
+      thresholdList.push({ fieldName: fieldKey(f), metricId: m.metricId, threshold: m.threshold })
+      thresholds.set(`${fieldKey(f)}|${m.metricId}`, m.threshold)
+    }
   }
 
   console.log(`[refilter] read ${pairs.length} pairs and ${scoreRows.length} scores in ${Date.now() - t0}ms`)
@@ -113,15 +121,14 @@ export async function refilterPairs(session: Session, signal?: AbortSignal): Pro
   `)
   db.transaction(() => {
     for (const u of updates) setSurfaced.run(u.surfaced, u.id)
-    for (const [key, threshold] of thresholds) {
-      const [fieldName, metricId] = key.split('|')
-      setScoreFlags.run(threshold, fieldName, metricId, session.id)
+    for (const t of thresholdList) {
+      setScoreFlags.run(t.threshold, t.fieldName, t.metricId, session.id)
     }
   })()
 
   if (toHydrate.length > 0) {
     const t = Date.now()
-    await hydrate(toHydrate, signal)
+    await hydrate(toHydrate, session.legs ?? [], signal)
     console.log(`[refilter] hydrated ${toHydrate.length} pairs in ${Date.now() - t}ms`)
   }
   return result
@@ -139,15 +146,18 @@ function hasLegacyTemporal(nodeAJson: string, nodeBJson: string): boolean {
 // per pass on Company against 12 MB for ids and scores alone.
 async function hydrate(
   pairs: { pairId: string; idA: string; idB: string }[],
+  legs: PatternLeg[],
   signal?: AbortSignal
 ): Promise<void> {
   const driver = getDriver()
-  const neo4jSession = driver.session()
+  const neo4jSession = driver.session({ database: getActiveDatabase() })
   try {
     const ids = new Set<string>()
     for (const p of pairs) { ids.add(p.idA); ids.add(p.idB) }
     const snapshots = new Map<string, NodeSnapshot>()
-    await loadSnapshots(neo4jSession, ids, snapshots, signal ?? new AbortController().signal)
+    // With the legs, so a promoted pair arrives carrying the related values the
+    // review panel shows and the export writes — not just its own properties.
+    await loadSnapshots(neo4jSession, ids, snapshots, signal ?? new AbortController().signal, legs)
 
     const db = getDb()
     const update = db.prepare('UPDATE pairs SET node_a_json = ?, node_b_json = ? WHERE id = ?')

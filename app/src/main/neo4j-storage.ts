@@ -1,5 +1,5 @@
 import type { Driver } from 'neo4j-driver'
-import { getDriver } from './connection-service'
+import { getDriver, getActiveDatabase } from './connection-service'
 import { getSettings } from './settings-service'
 import type { CandidatePair, AuditRecord } from '../shared/types'
 
@@ -30,7 +30,7 @@ let indexedDriver: Driver | null = null
 
 async function ensureIndexes(driver: Driver): Promise<void> {
   if (indexedDriver === driver) return
-  const session = driver.session()
+  const session = driver.session({ database: getActiveDatabase() })
   try {
     await session.run('CREATE INDEX er_pair_id IF NOT EXISTS FOR (p:ERPair) ON (p.pairId)')
     await session.run(
@@ -99,7 +99,7 @@ export async function writePairVerdicts(pairs: CandidatePair[]): Promise<void> {
   const driver = getDriver()
   await ensureIndexes(driver)
 
-  const session = driver.session()
+  const session = driver.session({ database: getActiveDatabase() })
   try {
     // A row whose node no longer exists (merged away since the verdict) is
     // dropped by the MATCH; the remaining rows are unaffected.
@@ -147,7 +147,7 @@ export async function writeAuditRecord(record: AuditRecord): Promise<void> {
   if (!isEnabled()) return
   const driver = getDriver()
   await ensureIndexes(driver)
-  const session = driver.session()
+  const session = driver.session({ database: getActiveDatabase() })
   try {
     await session.run(
       `CREATE (r:ERAuditRecord {
