@@ -6,11 +6,40 @@ Schema discovery, similarity scoring, review, and merging work against any label
 
 Built with Electron, React, TypeScript, and Tailwind CSS.
 
-**Version 0.1 — initial release.** Everything described below is implemented and
-has been run against live Neo4j instances, including labels of several million
-nodes. Treat the figures quoted throughout as measurements rather than targets:
-they come from real runs, and the section they appear in says which database and
-which configuration produced them.
+**Version 0.2.** Everything described below is implemented and has been run
+against live Neo4j instances, including labels of several million nodes. Treat
+the figures quoted throughout as measurements rather than targets: they come from
+real runs, and the section they appear in says which database and which
+configuration produced them.
+
+### New in 0.2
+
+- **Matching across a relationship.** A comparison can now include properties one
+  hop away — an address, a SIC code, a former name — in either direction and over
+  several relationships at once. Configure checks each leg for data, warns when two
+  legs are secretly the same edges, and the review panel and exports show the
+  related values. Only the primary label merges. See
+  [Matching across a relationship](#matching-across-a-relationship).
+- **Surfacing rules as boolean expressions.** A **Custom rule** nests ALL/ANY
+  groups to any depth, can embed a weighted average as a condition, and lets a
+  condition demand that both records carry its field. Conditions that cannot be
+  judged are left out rather than failed, and Estimate Pair Count reports each
+  condition separately so you can see which branch surfaces nothing. See
+  [Surfacing rules](#surfacing-rules).
+- **Warnings before a bad run.** Configure samples the blocking key and warns when
+  it cannot divide the label into small groups, and lists any compared field the
+  rule never uses.
+- **Lower memory during compute.** Candidates are written out as they are produced
+  instead of being held for the whole run, and a capture's node snapshots are
+  scoped to one batch.
+- **Fixes.** A connection profile's `database` is now used for every query — a
+  profile on a non-default database previously read as an empty graph. A failed
+  compute no longer leaves an orphaned session behind on each retry, and the prefix
+  walk no longer collects a block it then discards. Schema discovery overlaps its
+  two property queries, and related-node limits apply per node rather than per
+  batch.
+- **Security.** Electron 39 → 41 and patched transitive dependencies, resolving
+  the open Dependabot alerts.
 
 ---
 
@@ -484,7 +513,7 @@ RETURN r.label, r.nodesWalked, count(*) AS merges
 
 ### Prerequisites
 
-- Node.js 18+
+- Node.js 20+
 - A running Neo4j instance (5.x recommended)
 - APOC Core — bundled with Aura, optional on self-managed. Enables the faster merge path and the combine property strategy; the tool falls back to plain Cypher without it.
 
